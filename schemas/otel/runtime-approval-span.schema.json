@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/runtime-approval-span.schema.json",
+  "title": "DefenseClaw Exec Approval Span",
+  "description": "OTEL Span representing an exec.approval.requested → resolved lifecycle. Nested under the tool call span or standalone if no parent.",
+  "type": "object",
+  "required": ["name", "kind", "startTimeUnixNano", "attributes"],
+  "properties": {
+    "traceId": { "type": "string" },
+    "spanId": { "type": "string" },
+    "parentSpanId": {
+      "type": "string",
+      "description": "Parent tool call span ID, if available."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^exec\\.approval/.+$",
+      "description": "Format: exec.approval/{approval_id}",
+      "examples": ["exec.approval/a1b2c3d4-5678-90ab-cdef-1234567890ab"]
+    },
+    "kind": {
+      "type": "integer",
+      "const": 1,
+      "description": "SPAN_KIND_INTERNAL = 1"
+    },
+    "startTimeUnixNano": {
+      "type": "string",
+      "description": "exec.approval.requested event timestamp."
+    },
+    "endTimeUnixNano": {
+      "type": "string",
+      "description": "Timestamp when resolved (approved/denied) or timed out."
+    },
+    "status": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "enum": [0, 1, 2],
+          "description": "OK=1 if approved, ERROR=2 if denied."
+        },
+        "message": { "type": "string" }
+      }
+    },
+    "attributes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attribute" }
+    }
+  },
+  "$defs": {
+    "attribute": {
+      "type": "object",
+      "required": ["key", "value"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "object" }
+      }
+    },
+    "attributeDefinitions": {
+      "type": "object",
+      "description": "Semantic definition of all span attributes.",
+      "properties": {
+        "defenseclaw.approval.id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Approval request UUID from the gateway."
+        },
+        "defenseclaw.approval.command": {
+          "type": "string",
+          "description": "The raw command string (truncated)."
+        },
+        "defenseclaw.approval.argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Command argv array from SystemRunPlan."
+        },
+        "defenseclaw.approval.cwd": {
+          "type": "string",
+          "description": "Working directory from SystemRunPlan."
+        },
+        "defenseclaw.approval.result": {
+          "type": "string",
+          "enum": ["approved", "denied", "timeout"],
+          "description": "Final resolution."
+        },
+        "defenseclaw.approval.reason": {
+          "type": "string",
+          "description": "Reason for the resolution.",
+          "examples": [
+            "defenseclaw: command matched dangerous pattern",
+            "defenseclaw: auto-approved safe command"
+          ]
+        },
+        "defenseclaw.approval.auto": {
+          "type": "boolean",
+          "description": "True if auto-approved by DefenseClaw."
+        },
+        "defenseclaw.approval.dangerous": {
+          "type": "boolean",
+          "description": "True if the command matched a dangerous pattern."
+        }
+      }
+    }
+  }
+}

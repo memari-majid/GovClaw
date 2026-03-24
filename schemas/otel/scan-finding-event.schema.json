@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/scan-finding-event.schema.json",
+  "title": "DefenseClaw Scan Finding Event",
+  "description": "OTEL LogRecord emitted per individual finding. Opt-in via otel.logs.emit_individual_findings. Enables fine-grained Splunk search by severity, scanner, or tag.",
+  "type": "object",
+  "required": [
+    "timeUnixNano",
+    "severityText",
+    "severityNumber",
+    "body",
+    "attributes"
+  ],
+  "properties": {
+    "timeUnixNano": { "type": "string" },
+    "severityText": {
+      "type": "string",
+      "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+      "description": "Matches the finding severity."
+    },
+    "severityNumber": {
+      "type": "integer",
+      "enum": [9, 13, 17, 21]
+    },
+    "body": {
+      "type": "object",
+      "properties": {
+        "stringValue": {
+          "type": "string",
+          "description": "Finding title and description summary."
+        }
+      }
+    },
+    "attributes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attribute" }
+    }
+  },
+  "$defs": {
+    "attribute": {
+      "type": "object",
+      "required": ["key", "value"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "object" }
+      }
+    },
+    "attributeDefinitions": {
+      "type": "object",
+      "description": "Semantic definition of all attributes on finding events.",
+      "properties": {
+        "event.name": {
+          "type": "string",
+          "const": "scan.finding"
+        },
+        "event.domain": {
+          "type": "string",
+          "const": "defenseclaw.scan"
+        },
+        "defenseclaw.scan.id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Parent scan UUID."
+        },
+        "defenseclaw.finding.id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique finding identifier."
+        },
+        "defenseclaw.finding.severity": {
+          "type": "string",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        },
+        "defenseclaw.finding.title": {
+          "type": "string",
+          "description": "Short finding title."
+        },
+        "defenseclaw.finding.scanner": {
+          "type": "string",
+          "description": "Scanner that produced this finding."
+        },
+        "defenseclaw.finding.location": {
+          "type": "string",
+          "description": "File and line/section reference."
+        },
+        "defenseclaw.finding.tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Classification tags."
+        },
+        "defenseclaw.scan.target": {
+          "type": "string",
+          "description": "Asset that was scanned."
+        },
+        "defenseclaw.scan.target_type": {
+          "type": "string",
+          "enum": ["skill", "mcp", "plugin"]
+        }
+      }
+    }
+  }
+}

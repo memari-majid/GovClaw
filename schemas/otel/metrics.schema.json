@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/metrics.schema.json",
+  "title": "DefenseClaw OTEL Metrics",
+  "description": "All OTEL metrics emitted by DefenseClaw. Defines metric names, types, units, and attribute dimensions for Splunk Infrastructure Monitoring dashboards and detectors.",
+  "type": "object",
+  "properties": {
+    "scan_metrics": {
+      "type": "array",
+      "description": "Metrics related to asset scanning.",
+      "items": { "$ref": "#/$defs/metricDef" },
+      "default": [
+        {
+          "name": "defenseclaw.scan.count",
+          "type": "counter",
+          "unit": "{scan}",
+          "description": "Total number of scans completed.",
+          "attributes": {
+            "scanner": {
+              "type": "string",
+              "enum": ["skill-scanner", "mcp-scanner", "cisco-aibom"],
+              "description": "Scanner that performed the scan."
+            },
+            "target_type": {
+              "type": "string",
+              "enum": ["skill", "mcp", "plugin"]
+            },
+            "verdict": {
+              "type": "string",
+              "enum": ["clean", "warning", "blocked", "rejected"]
+            }
+          }
+        },
+        {
+          "name": "defenseclaw.scan.duration",
+          "type": "histogram",
+          "unit": "ms",
+          "description": "Scan duration distribution.",
+          "attributes": {
+            "scanner": { "type": "string" },
+            "target_type": { "type": "string", "enum": ["skill", "mcp", "plugin"] }
+          }
+        },
+        {
+          "name": "defenseclaw.scan.findings",
+          "type": "counter",
+          "unit": "{finding}",
+          "description": "Total findings across all scans.",
+          "attributes": {
+            "scanner": { "type": "string" },
+            "target_type": { "type": "string", "enum": ["skill", "mcp", "plugin"] },
+            "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] }
+          }
+        },
+        {
+          "name": "defenseclaw.scan.findings.gauge",
+          "type": "updowncounter",
+          "unit": "{finding}",
+          "description": "Current open finding count (latest state).",
+          "attributes": {
+            "target_type": { "type": "string", "enum": ["skill", "mcp", "plugin"] },
+            "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] }
+          }
+        }
+      ]
+    },
+    "runtime_metrics": {
+      "type": "array",
+      "description": "Metrics related to runtime tool and LLM calls.",
+      "items": { "$ref": "#/$defs/metricDef" },
+      "default": [
+        {
+          "name": "defenseclaw.tool.calls",
+          "type": "counter",
+          "unit": "{call}",
+          "description": "Total tool calls observed.",
+          "attributes": {
+            "tool.name": { "type": "string", "description": "Tool name." },
+            "tool.provider": { "type": "string", "enum": ["skill", "builtin", "mcp"] },
+            "dangerous": { "type": "boolean" }
+          }
+        },
+        {
+          "name": "defenseclaw.tool.duration",
+          "type": "histogram",
+          "unit": "ms",
+          "description": "Tool call duration distribution.",
+          "attributes": {
+            "tool.name": { "type": "string" },
+            "tool.provider": { "type": "string", "enum": ["skill", "builtin", "mcp"] }
+          }
+        },
+        {
+          "name": "defenseclaw.tool.errors",
+          "type": "counter",
+          "unit": "{error}",
+          "description": "Tool calls that returned non-zero exit codes.",
+          "attributes": {
+            "tool.name": { "type": "string" },
+            "exit_code": { "type": "integer" }
+          }
+        },
+        {
+          "name": "defenseclaw.approval.count",
+          "type": "counter",
+          "unit": "{request}",
+          "description": "Exec approval requests processed.",
+          "attributes": {
+            "result": { "type": "string", "enum": ["approved", "denied", "timeout"] },
+            "auto": { "type": "boolean" },
+            "dangerous": { "type": "boolean" }
+          }
+        },
+        {
+          "name": "defenseclaw.llm.calls",
+          "type": "counter",
+          "unit": "{call}",
+          "description": "Total LLM calls observed.",
+          "attributes": {
+            "gen_ai.system": { "type": "string" },
+            "gen_ai.request.model": { "type": "string" }
+          }
+        },
+        {
+          "name": "defenseclaw.llm.tokens",
+          "type": "counter",
+          "unit": "{token}",
+          "description": "Total tokens consumed.",
+          "attributes": {
+            "gen_ai.system": { "type": "string" },
+            "token.type": { "type": "string", "enum": ["prompt", "completion"] }
+          }
+        },
+        {
+          "name": "defenseclaw.llm.duration",
+          "type": "histogram",
+          "unit": "ms",
+          "description": "LLM call duration distribution.",
+          "attributes": {
+            "gen_ai.system": { "type": "string" },
+            "gen_ai.request.model": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "alert_metrics": {
+      "type": "array",
+      "description": "Metrics related to runtime alerts and guardrail evaluations.",
+      "items": { "$ref": "#/$defs/metricDef" },
+      "default": [
+        {
+          "name": "defenseclaw.alert.count",
+          "type": "counter",
+          "unit": "{alert}",
+          "description": "Total runtime alerts emitted.",
+          "attributes": {
+            "alert.type": {
+              "type": "string",
+              "enum": ["dangerous-command", "guardrail-flag", "guardrail-block", "prompt-injection", "data-exfiltration", "content-violation"]
+            },
+            "alert.severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+            "alert.source": { "type": "string", "enum": ["local-pattern", "local-guardrail", "ai-defense", "opa-policy", "codeguard"] }
+          }
+        },
+        {
+          "name": "defenseclaw.guardrail.evaluations",
+          "type": "counter",
+          "unit": "{evaluation}",
+          "description": "Total guardrail evaluations performed.",
+          "attributes": {
+            "guardrail.scanner": { "type": "string", "enum": ["ai-defense", "skill-scanner", "opa"] },
+            "guardrail.action_taken": { "type": "string", "enum": ["log", "warn", "block", "deny"] }
+          }
+        },
+        {
+          "name": "defenseclaw.guardrail.latency",
+          "type": "histogram",
+          "unit": "ms",
+          "description": "Guardrail evaluation latency distribution.",
+          "attributes": {
+            "guardrail.scanner": { "type": "string", "enum": ["ai-defense", "skill-scanner", "opa"] }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "metricDef": {
+      "type": "object",
+      "required": ["name", "type", "unit", "description", "attributes"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Fully qualified metric name."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["counter", "histogram", "updowncounter", "gauge"],
+          "description": "OTEL instrument type."
+        },
+        "unit": {
+          "type": "string",
+          "description": "Unit annotation per OTEL conventions."
+        },
+        "description": {
+          "type": "string"
+        },
+        "attributes": {
+          "type": "object",
+          "description": "Attribute dimensions for this metric.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string" },
+              "enum": { "type": "array" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

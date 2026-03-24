@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/scan-result-event.schema.json",
+  "title": "DefenseClaw Scan Result Event",
+  "description": "OTEL LogRecord emitted on scan completion. Body contains the full structured scan result; attributes provide indexed fields for Splunk queries.",
+  "type": "object",
+  "required": [
+    "timeUnixNano",
+    "severityText",
+    "severityNumber",
+    "body",
+    "attributes"
+  ],
+  "properties": {
+    "timeUnixNano": {
+      "type": "string",
+      "description": "Scan completion timestamp in nanoseconds since Unix epoch."
+    },
+    "severityText": {
+      "type": "string",
+      "enum": ["INFO", "WARN", "ERROR"],
+      "description": "Derived from MaxSeverity: CRITICAL→ERROR, HIGH→WARN, else INFO."
+    },
+    "severityNumber": {
+      "type": "integer",
+      "enum": [9, 13, 17]
+    },
+    "body": {
+      "type": "object",
+      "description": "JSON-encoded scan summary as OTEL AnyValue.",
+      "properties": {
+        "stringValue": {
+          "type": "string",
+          "description": "JSON string of the scan result body."
+        }
+      }
+    },
+    "attributes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attribute" }
+    }
+  },
+  "$defs": {
+    "attribute": {
+      "type": "object",
+      "required": ["key", "value"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": {
+          "type": "object",
+          "properties": {
+            "stringValue": { "type": "string" },
+            "intValue": { "type": "string" },
+            "doubleValue": { "type": "number" }
+          }
+        }
+      }
+    },
+    "attributeDefinitions": {
+      "type": "object",
+      "description": "Semantic definition of all attributes on scan result events.",
+      "properties": {
+        "event.name": {
+          "type": "string",
+          "const": "scan.completed"
+        },
+        "event.domain": {
+          "type": "string",
+          "const": "defenseclaw.scan"
+        },
+        "defenseclaw.scan.id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique scan identifier."
+        },
+        "defenseclaw.scan.scanner": {
+          "type": "string",
+          "enum": ["skill-scanner", "mcp-scanner", "cisco-aibom"],
+          "description": "Scanner that performed the scan. May also be a plugin name."
+        },
+        "defenseclaw.scan.target": {
+          "type": "string",
+          "description": "Name or path of the scanned asset."
+        },
+        "defenseclaw.scan.target_type": {
+          "type": "string",
+          "enum": ["skill", "mcp", "plugin"]
+        },
+        "defenseclaw.scan.duration_ms": {
+          "type": "integer",
+          "description": "Scan duration in milliseconds."
+        },
+        "defenseclaw.scan.finding_count": {
+          "type": "integer",
+          "description": "Total number of findings."
+        },
+        "defenseclaw.scan.max_severity": {
+          "type": "string",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        },
+        "defenseclaw.scan.finding_count.critical": {
+          "type": "integer"
+        },
+        "defenseclaw.scan.finding_count.high": {
+          "type": "integer"
+        },
+        "defenseclaw.scan.finding_count.medium": {
+          "type": "integer"
+        },
+        "defenseclaw.scan.finding_count.low": {
+          "type": "integer"
+        },
+        "defenseclaw.scan.verdict": {
+          "type": "string",
+          "enum": ["clean", "warning", "blocked", "rejected"],
+          "description": "Admission gate verdict based on the scan."
+        }
+      }
+    },
+    "scanResultBody": {
+      "type": "object",
+      "title": "Scan Result Body",
+      "description": "Structure of the JSON body embedded in the LogRecord.",
+      "required": ["scan_id", "scanner", "target", "target_type", "timestamp", "finding_count", "max_severity", "findings"],
+      "properties": {
+        "scan_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "scanner": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "target_type": {
+          "type": "string",
+          "enum": ["skill", "mcp", "plugin"]
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "finding_count": {
+          "type": "integer"
+        },
+        "max_severity": {
+          "type": "string",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["id", "severity", "title", "scanner"],
+      "properties": {
+        "id": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "location": { "type": "string" },
+        "remediation": { "type": "string" },
+        "scanner": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

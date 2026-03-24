@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/resource.schema.json",
+  "title": "DefenseClaw OTEL Resource",
+  "description": "Resource attributes attached to all OTLP exports (logs, traces, metrics). Set once at sidecar startup.",
+  "type": "object",
+  "required": [
+    "service.name",
+    "service.version",
+    "service.namespace",
+    "deployment.environment",
+    "host.name",
+    "host.arch",
+    "os.type",
+    "defenseclaw.claw.mode",
+    "defenseclaw.instance.id"
+  ],
+  "properties": {
+    "service.name": {
+      "type": "string",
+      "const": "defenseclaw",
+      "description": "Always 'defenseclaw'."
+    },
+    "service.version": {
+      "type": "string",
+      "description": "Binary version, e.g. '0.5.0'.",
+      "examples": ["0.5.0", "1.0.0-rc1"]
+    },
+    "service.namespace": {
+      "type": "string",
+      "const": "ai-governance",
+      "description": "Service namespace for grouping in Splunk APM."
+    },
+    "deployment.environment": {
+      "type": "string",
+      "enum": ["macos", "dgx-spark", "linux"],
+      "description": "Detected runtime environment."
+    },
+    "host.name": {
+      "type": "string",
+      "description": "OS hostname."
+    },
+    "host.arch": {
+      "type": "string",
+      "enum": ["amd64", "arm64"],
+      "description": "CPU architecture (runtime.GOARCH)."
+    },
+    "os.type": {
+      "type": "string",
+      "enum": ["darwin", "linux"],
+      "description": "Operating system (runtime.GOOS)."
+    },
+    "defenseclaw.claw.mode": {
+      "type": "string",
+      "enum": ["openclaw", "nemoclaw", "opencode", "codex"],
+      "description": "Active agent framework mode."
+    },
+    "defenseclaw.claw.home_dir": {
+      "type": "string",
+      "description": "Resolved home directory of the active claw framework.",
+      "examples": ["/home/user/.openclaw"]
+    },
+    "defenseclaw.device.id": {
+      "type": "string",
+      "description": "Hex-encoded SHA-256 fingerprint of the Ed25519 device public key."
+    },
+    "defenseclaw.gateway.host": {
+      "type": "string",
+      "description": "Gateway host from config.",
+      "examples": ["127.0.0.1"]
+    },
+    "defenseclaw.gateway.port": {
+      "type": "integer",
+      "description": "Gateway port from config.",
+      "examples": [18789]
+    },
+    "defenseclaw.instance.id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID generated at sidecar startup. Unique per process lifetime."
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defenseclaw.dev/schemas/otel/asset-lifecycle-event.schema.json",
+  "title": "DefenseClaw Asset Lifecycle Event",
+  "description": "OTEL LogRecord emitted when a skill, plugin, or MCP server is installed, uninstalled, blocked, allowed, quarantined, restored, enabled, or disabled.",
+  "type": "object",
+  "required": [
+    "timeUnixNano",
+    "severityText",
+    "severityNumber",
+    "body",
+    "attributes"
+  ],
+  "properties": {
+    "timeUnixNano": {
+      "type": "string",
+      "description": "Event timestamp in nanoseconds since Unix epoch."
+    },
+    "observedTimeUnixNano": {
+      "type": "string",
+      "description": "Timestamp when DefenseClaw processed the event."
+    },
+    "severityText": {
+      "type": "string",
+      "enum": ["INFO", "WARN", "ERROR"]
+    },
+    "severityNumber": {
+      "type": "integer",
+      "enum": [9, 13, 17],
+      "description": "OTEL severity number: INFO=9, WARN=13, ERROR=17."
+    },
+    "body": {
+      "type": "object",
+      "properties": {
+        "stringValue": {
+          "type": "string",
+          "description": "Human-readable event summary.",
+          "examples": [
+            "skill @anthropic/code-review blocked: HIGH severity findings detected",
+            "mcp filesystem-server installed via deploy command"
+          ]
+        }
+      },
+      "required": ["stringValue"]
+    },
+    "attributes": {
+      "type": "array",
+      "description": "OTLP key-value attribute array.",
+      "items": {
+        "$ref": "#/$defs/attribute"
+      }
+    }
+  },
+  "$defs": {
+    "attribute": {
+      "type": "object",
+      "required": ["key", "value"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": {
+          "type": "object",
+          "properties": {
+            "stringValue": { "type": "string" },
+            "intValue": { "type": "string" },
+            "boolValue": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "attributeDefinitions": {
+      "type": "object",
+      "description": "Semantic definition of all attributes on this event type.",
+      "properties": {
+        "event.name": {
+          "type": "string",
+          "description": "The lifecycle action name.",
+          "enum": ["install", "uninstall", "block", "allow", "quarantine", "restore", "enable", "disable"]
+        },
+        "event.domain": {
+          "type": "string",
+          "const": "defenseclaw.asset"
+        },
+        "defenseclaw.asset.type": {
+          "type": "string",
+          "enum": ["skill", "mcp", "plugin"],
+          "description": "Kind of asset."
+        },
+        "defenseclaw.asset.name": {
+          "type": "string",
+          "description": "Asset identifier, e.g. '@anthropic/code-review'."
+        },
+        "defenseclaw.asset.source_path": {
+          "type": "string",
+          "description": "On-disk path to the asset. May be empty if unknown."
+        },
+        "defenseclaw.lifecycle.action": {
+          "type": "string",
+          "enum": ["install", "uninstall", "block", "allow", "quarantine", "restore", "enable", "disable"],
+          "description": "Normalized lifecycle action."
+        },
+        "defenseclaw.lifecycle.reason": {
+          "type": "string",
+          "description": "Human-readable reason for the action."
+        },
+        "defenseclaw.lifecycle.actor": {
+          "type": "string",
+          "enum": ["defenseclaw", "user", "watcher", "gateway"],
+          "description": "Who or what initiated the action."
+        },
+        "defenseclaw.enforcement.install": {
+          "type": "string",
+          "enum": ["block", "allow", ""],
+          "description": "Current install enforcement state after action."
+        },
+        "defenseclaw.enforcement.file": {
+          "type": "string",
+          "enum": ["quarantine", ""],
+          "description": "Current file enforcement state after action."
+        },
+        "defenseclaw.enforcement.runtime": {
+          "type": "string",
+          "enum": ["disable", ""],
+          "description": "Current runtime enforcement state after action."
+        }
+      }
+    }
+  }
+}
