@@ -59,11 +59,16 @@ class PluginScannerWrapper:
         if lenient:
             args.append("--lenient")
 
-        # Pass LLM API key via environment (same pattern as skill scanner)
-        env = None
+        # Set up environment:
+        # - PYTHONPATH so the Node binary can find cli/defenseclaw/llm.py (litellm bridge)
+        # - SKILL_SCANNER_LLM_API_KEY for the LLM API key
+        import os
+        cli_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath = f"{cli_dir}:{existing_pythonpath}" if existing_pythonpath else cli_dir
+        env = {**os.environ, "PYTHONPATH": pythonpath}
         if llm_api_key:
-            import os
-            env = {**os.environ, "SKILL_SCANNER_LLM_API_KEY": llm_api_key}
+            env["SKILL_SCANNER_LLM_API_KEY"] = llm_api_key
 
         try:
             proc = subprocess.run(
