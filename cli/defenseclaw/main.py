@@ -17,6 +17,7 @@ from defenseclaw.commands.cmd_deploy import deploy
 from defenseclaw.commands.cmd_init import init_cmd
 from defenseclaw.commands.cmd_mcp import mcp
 from defenseclaw.commands.cmd_plugin import plugin
+from defenseclaw.commands.cmd_policy import policy
 from defenseclaw.commands.cmd_setup import setup
 from defenseclaw.commands.cmd_sidecar import sidecar
 from defenseclaw.commands.cmd_skill import skill
@@ -90,6 +91,7 @@ cli.add_command(deploy)
 cli.add_command(sidecar)
 cli.add_command(skill)
 cli.add_command(plugin)
+cli.add_command(policy)
 cli.add_command(mcp)
 cli.add_command(aibom)
 cli.add_command(status)

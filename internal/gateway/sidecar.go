@@ -178,7 +178,13 @@ func (s *Sidecar) runWatcher(ctx context.Context) error {
 	// Until then, no MCP watching from the sidecar.
 	var mcpDirs []string
 
-	if len(skillDirs) == 0 && len(mcpDirs) == 0 {
+	// Plugin dirs from the config plugin_dir.
+	var pluginDirs []string
+	if s.cfg.PluginDir != "" {
+		pluginDirs = []string{s.cfg.PluginDir}
+	}
+
+	if len(skillDirs) == 0 && len(mcpDirs) == 0 && len(pluginDirs) == 0 {
 		s.health.SetWatcher(StateError, "no directories configured", nil)
 		fmt.Fprintf(os.Stderr, "[sidecar] watcher: no directories to watch\n")
 		<-ctx.Done()
@@ -206,7 +212,7 @@ func (s *Sidecar) runWatcher(ctx context.Context) error {
 		}
 	}
 
-	w := watcher.New(s.cfg, skillDirs, mcpDirs, s.store, s.logger, s.shell, opa, func(r watcher.AdmissionResult) {
+	w := watcher.New(s.cfg, skillDirs, mcpDirs, pluginDirs, s.store, s.logger, s.shell, opa, func(r watcher.AdmissionResult) {
 		s.handleAdmissionResult(r)
 	})
 

@@ -1,0 +1,115 @@
+package scanner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"time"
+)
+
+type PluginScanner struct {
+	BinaryPath string
+}
+
+func NewPluginScanner(binaryPath string) *PluginScanner {
+	if binaryPath == "" {
+		binaryPath = "defenseclaw-plugin-scanner"
+	}
+	return &PluginScanner{BinaryPath: binaryPath}
+}
+
+func (s *PluginScanner) Name() string              { return "plugin-scanner" }
+func (s *PluginScanner) Version() string            { return "1.0.0" }
+func (s *PluginScanner) SupportedTargets() []string { return []string{"plugin"} }
+
+func (s *PluginScanner) Scan(ctx context.Context, target string) (*ScanResult, error) {
+	start := time.Now()
+
+	cmd := exec.CommandContext(ctx, s.BinaryPath, target)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	duration := time.Since(start)
+
+	result := &ScanResult{
+		Scanner:   s.Name(),
+		Target:    target,
+		Timestamp: start,
+		Duration:  duration,
+	}
+
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, fmt.Errorf("scanner: %s not found at %q — build with: cd extensions/defenseclaw && npm run build && npm link", s.Name(), s.BinaryPath)
+		}
+		if stdout.Len() == 0 {
+			return nil, fmt.Errorf("scanner: %s failed: %s", s.Name(), stderr.String())
+		}
+	}
+
+	if stdout.Len() > 0 {
+		findings, parseErr := parsePluginOutput(stdout.Bytes())
+		if parseErr != nil {
+			return nil, fmt.Errorf("scanner: failed to parse %s output: %w", s.Name(), parseErr)
+		}
+		result.Findings = findings
+	}
+
+	return result, nil
+}
+
+// pluginScanResult matches the ScanResult type from the TypeScript plugin scanner
+// (extensions/defenseclaw/src/types.ts). The scanner outputs a full ScanResult
+// with scanner, target, timestamp, findings, duration_ns, metadata, and assessment.
+type pluginScanResult struct {
+	Scanner    string          `json:"scanner"`
+	Target     string          `json:"target"`
+	Timestamp  string          `json:"timestamp"`
+	Findings   []pluginFinding `json:"findings"`
+	DurationNs int64           `json:"duration_ns"`
+}
+
+type pluginFinding struct {
+	ID              string   `json:"id"`
+	RuleID          string   `json:"rule_id"`
+	Severity        string   `json:"severity"`
+	Confidence      float64  `json:"confidence"`
+	Title           string   `json:"title"`
+	Description     string   `json:"description"`
+	Evidence        string   `json:"evidence"`
+	Location        string   `json:"location"`
+	Remediation     string   `json:"remediation"`
+	Tags            []string `json:"tags"`
+	OccurrenceCount int      `json:"occurrence_count"`
+	Suppressed      bool     `json:"suppressed"`
+}
+
+func parsePluginOutput(data []byte) ([]Finding, error) {
+	var out pluginScanResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+
+	findings := make([]Finding, 0, len(out.Findings))
+	for _, f := range out.Findings {
+		if f.Suppressed {
+			continue
+		}
+		findings = append(findings, Finding{
+			ID:          f.ID,
+			Severity:    Severity(f.Severity),
+			Title:       f.Title,
+			Description: f.Description,
+			Location:    f.Location,
+			Remediation: f.Remediation,
+			Scanner:     "plugin-scanner",
+			Tags:        f.Tags,
+		})
+	}
+	return findings, nil
+}

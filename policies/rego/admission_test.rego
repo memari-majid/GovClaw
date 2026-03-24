@@ -222,3 +222,107 @@ test_permissive_high_warning if {
 
 	result.verdict == "warning"
 }
+
+# --- Plugin target type ---
+
+test_plugin_blocked if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "evil-plugin",
+		"path": "/tmp/evil-plugin",
+		"block_list": [{"target_type": "plugin", "target_name": "evil-plugin", "reason": "malicious"}],
+		"allow_list": [],
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {}
+		with data.severity_ranking as {}
+
+	result.verdict == "blocked"
+}
+
+test_plugin_allowed if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "trusted-plugin",
+		"path": "/tmp/trusted-plugin",
+		"block_list": [],
+		"allow_list": [{"target_type": "plugin", "target_name": "trusted-plugin", "reason": "vendor"}],
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {}
+		with data.severity_ranking as {}
+
+	result.verdict == "allowed"
+}
+
+test_plugin_rejected_critical if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "bad-plugin",
+		"path": "/tmp/bad-plugin",
+		"block_list": [],
+		"allow_list": [],
+		"scan_result": {"max_severity": "CRITICAL", "total_findings": 1, "findings": [
+			{"severity": "CRITICAL", "title": "credential theft", "scanner": "plugin-scanner"},
+		]},
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {"CRITICAL": {"runtime": "block", "file": "quarantine"}}
+		with data.severity_ranking as {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3}
+
+	result.verdict == "rejected"
+	result.file_action == "quarantine"
+}
+
+test_plugin_clean_scan if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "safe-plugin",
+		"path": "/tmp/safe-plugin",
+		"block_list": [],
+		"allow_list": [],
+		"scan_result": {"max_severity": "INFO", "total_findings": 0, "findings": []},
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {"INFO": {"runtime": "allow", "file": "none"}}
+		with data.severity_ranking as {"INFO": 1}
+
+	result.verdict == "clean"
+}
+
+test_plugin_warning_medium if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "med-plugin",
+		"path": "/tmp/med-plugin",
+		"block_list": [],
+		"allow_list": [],
+		"scan_result": {"max_severity": "MEDIUM", "total_findings": 1, "findings": [
+			{"severity": "MEDIUM", "title": "minor perm", "scanner": "plugin-scanner"},
+		]},
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {
+			"CRITICAL": {"runtime": "block", "file": "quarantine"},
+			"HIGH": {"runtime": "block", "file": "quarantine"},
+			"MEDIUM": {"runtime": "allow", "file": "none"},
+		}
+		with data.severity_ranking as {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3}
+
+	result.verdict == "warning"
+}
+
+test_plugin_not_cross_matched_with_skill if {
+	result := admission with input as {
+		"target_type": "plugin",
+		"target_name": "my-plugin",
+		"path": "/tmp/my-plugin",
+		"block_list": [{"target_type": "skill", "target_name": "my-plugin", "reason": "wrong type"}],
+		"allow_list": [],
+	}
+		with data.config as {"allow_list_bypass_scan": true}
+		with data.actions as {}
+		with data.severity_ranking as {}
+
+	result.verdict != "blocked"
+}

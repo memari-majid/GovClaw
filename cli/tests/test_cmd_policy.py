@@ -1,0 +1,234 @@
+"""Tests for 'defenseclaw policy' command group — create, list, show, activate, delete."""
+
+import json
+import os
+import shutil
+import tempfile
+import unittest
+
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from click.testing import CliRunner
+
+from defenseclaw.commands.cmd_policy import policy
+from tests.helpers import make_app_context, cleanup_app
+
+
+class PolicyCommandTestBase(unittest.TestCase):
+    def setUp(self):
+        self.app, self.tmp_dir, self.db_path = make_app_context()
+        os.makedirs(self.app.cfg.policy_dir, exist_ok=True)
+        self.runner = CliRunner()
+
+    def tearDown(self):
+        cleanup_app(self.app, self.db_path, self.tmp_dir)
+
+    def invoke(self, args: list[str]):
+        return self.runner.invoke(policy, args, obj=self.app, catch_exceptions=False)
+
+
+class TestPolicyCreate(PolicyCommandTestBase):
+    def test_create_basic(self):
+        result = self.invoke(["create", "my-policy"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("my-policy", result.output)
+        self.assertIn("created", result.output)
+
+        path = os.path.join(self.app.cfg.policy_dir, "my-policy.yaml")
+        self.assertTrue(os.path.isfile(path))
+
+    def test_create_with_description(self):
+        result = self.invoke(["create", "desc-policy", "-d", "My custom description"])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        import yaml
+        path = os.path.join(self.app.cfg.policy_dir, "desc-policy.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        self.assertEqual(data["description"], "My custom description")
+
+    def test_create_from_preset(self):
+        result = self.invoke(["create", "from-strict", "--from-preset", "strict"])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        import yaml
+        path = os.path.join(self.app.cfg.policy_dir, "from-strict.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        self.assertEqual(data["name"], "from-strict")
+        # Strict blocks medium
+        self.assertEqual(data["skill_actions"]["medium"]["install"], "block")
+
+    def test_create_with_severity_overrides(self):
+        result = self.invoke([
+            "create", "custom-sev",
+            "--critical-action", "block",
+            "--high-action", "block",
+            "--medium-action", "warn",
+            "--low-action", "allow",
+        ])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        import yaml
+        path = os.path.join(self.app.cfg.policy_dir, "custom-sev.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        self.assertEqual(data["skill_actions"]["critical"]["install"], "block")
+        self.assertEqual(data["skill_actions"]["critical"]["file"], "quarantine")
+        self.assertEqual(data["skill_actions"]["medium"]["install"], "none")
+        self.assertEqual(data["skill_actions"]["low"]["file"], "none")
+
+    def test_create_refuses_builtin_name(self):
+        result = self.invoke(["create", "default"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("cannot overwrite", result.output)
+
+    def test_create_refuses_duplicate(self):
+        self.invoke(["create", "dup-policy"])
+        result = self.invoke(["create", "dup-policy"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("already exists", result.output)
+
+    def test_create_no_scan_on_install(self):
+        result = self.invoke(["create", "noscan", "--no-scan-on-install"])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        import yaml
+        path = os.path.join(self.app.cfg.policy_dir, "noscan.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        self.assertFalse(data["admission"]["scan_on_install"])
+
+    def test_create_logs_action(self):
+        self.invoke(["create", "logged-policy"])
+        events = self.app.store.list_events(10)
+        actions = [e for e in events if e.action == "policy-create"]
+        self.assertEqual(len(actions), 1)
+
+
+class TestPolicyList(PolicyCommandTestBase):
+    def test_list_shows_builtins(self):
+        result = self.invoke(["list"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("default", result.output)
+        self.assertIn("strict", result.output)
+        self.assertIn("permissive", result.output)
+
+    def test_list_shows_custom_policy(self):
+        self.invoke(["create", "my-custom"])
+        result = self.invoke(["list"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("my-custom", result.output)
+
+
+class TestPolicyShow(PolicyCommandTestBase):
+    def test_show_builtin(self):
+        result = self.invoke(["show", "default"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("CRITICAL", result.output)
+        self.assertIn("HIGH", result.output)
+        self.assertIn("MEDIUM", result.output)
+
+    def test_show_custom(self):
+        self.invoke(["create", "show-me", "-d", "Test policy"])
+        result = self.invoke(["show", "show-me"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("show-me", result.output)
+        self.assertIn("Test policy", result.output)
+
+    def test_show_nonexistent(self):
+        result = self.invoke(["show", "does-not-exist"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not found", result.output)
+
+
+class TestPolicyActivate(PolicyCommandTestBase):
+    def test_activate_builtin(self):
+        result = self.invoke(["activate", "strict"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("activated", result.output)
+
+        # Check config was updated
+        self.assertEqual(self.app.cfg.skill_actions.medium.install, "block")
+
+    def test_activate_custom(self):
+        self.invoke(["create", "my-active", "--medium-action", "block"])
+        result = self.invoke(["activate", "my-active"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("activated", result.output)
+        self.assertEqual(self.app.cfg.skill_actions.medium.install, "block")
+
+    def test_activate_nonexistent(self):
+        result = self.invoke(["activate", "ghost"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not found", result.output)
+
+    def test_activate_logs_action(self):
+        self.invoke(["activate", "default"])
+        events = self.app.store.list_events(10)
+        actions = [e for e in events if e.action == "policy-activate"]
+        self.assertEqual(len(actions), 1)
+
+
+class TestPolicyDelete(PolicyCommandTestBase):
+    def test_delete_custom(self):
+        self.invoke(["create", "deletable"])
+        result = self.invoke(["delete", "deletable"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("deleted", result.output)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.app.cfg.policy_dir, "deletable.yaml")
+        ))
+
+    def test_delete_builtin_refused(self):
+        result = self.invoke(["delete", "default"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("cannot delete", result.output)
+
+    def test_delete_nonexistent(self):
+        result = self.invoke(["delete", "nope"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not found", result.output)
+
+    def test_delete_logs_action(self):
+        self.invoke(["create", "to-delete"])
+        self.invoke(["delete", "to-delete"])
+        events = self.app.store.list_events(10)
+        actions = [e for e in events if e.action == "policy-delete"]
+        self.assertEqual(len(actions), 1)
+
+
+class TestPolicyLifecycle(PolicyCommandTestBase):
+    def test_create_show_activate_delete(self):
+        # Create
+        result = self.invoke([
+            "create", "lifecycle-test",
+            "-d", "Lifecycle test policy",
+            "--critical-action", "block",
+            "--high-action", "block",
+            "--medium-action", "block",
+        ])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        # Show
+        result = self.invoke(["show", "lifecycle-test"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("lifecycle-test", result.output)
+
+        # List
+        result = self.invoke(["list"])
+        self.assertIn("lifecycle-test", result.output)
+
+        # Activate
+        result = self.invoke(["activate", "lifecycle-test"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.app.cfg.skill_actions.medium.install, "block")
+
+        # Delete
+        result = self.invoke(["delete", "lifecycle-test"])
+        self.assertEqual(result.exit_code, 0, result.output)
+
+
+if __name__ == "__main__":
+    unittest.main()

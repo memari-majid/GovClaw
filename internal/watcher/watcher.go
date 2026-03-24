@@ -23,8 +23,9 @@ import (
 type InstallType string
 
 const (
-	InstallSkill InstallType = "skill"
-	InstallMCP   InstallType = "mcp"
+	InstallSkill  InstallType = "skill"
+	InstallMCP    InstallType = "mcp"
+	InstallPlugin InstallType = "plugin"
 )
 
 // InstallEvent is emitted when the watcher detects a new skill or MCP server.
@@ -60,15 +61,16 @@ type OnAdmission func(AdmissionResult)
 // InstallWatcher monitors OpenClaw skill and MCP directories for new installs
 // and runs the admission gate (block → allow → scan) on each detection.
 type InstallWatcher struct {
-	cfg       *config.Config
-	skillDirs []string
-	mcpDirs   []string
-	store     *audit.Store
-	logger    *audit.Logger
-	shell     *sandbox.OpenShell
-	opa       *policy.Engine
-	debounce  time.Duration
-	onAdmit   OnAdmission
+	cfg        *config.Config
+	skillDirs  []string
+	mcpDirs    []string
+	pluginDirs []string
+	store      *audit.Store
+	logger     *audit.Logger
+	shell      *sandbox.OpenShell
+	opa        *policy.Engine
+	debounce   time.Duration
+	onAdmit    OnAdmission
 
 	mu      sync.Mutex
 	pending map[string]time.Time // path → first-seen, for debounce
@@ -76,22 +78,23 @@ type InstallWatcher struct {
 
 // New creates an InstallWatcher. The opa parameter may be nil to fall back
 // to the built-in Go admission logic.
-func New(cfg *config.Config, skillDirs, mcpDirs []string, store *audit.Store, logger *audit.Logger, shell *sandbox.OpenShell, opa *policy.Engine, onAdmit OnAdmission) *InstallWatcher {
+func New(cfg *config.Config, skillDirs, mcpDirs, pluginDirs []string, store *audit.Store, logger *audit.Logger, shell *sandbox.OpenShell, opa *policy.Engine, onAdmit OnAdmission) *InstallWatcher {
 	debounce := time.Duration(cfg.Watch.DebounceMs) * time.Millisecond
 	if debounce <= 0 {
 		debounce = 500 * time.Millisecond
 	}
 	return &InstallWatcher{
-		cfg:       cfg,
-		skillDirs: skillDirs,
-		mcpDirs:   mcpDirs,
-		store:     store,
-		logger:    logger,
-		shell:     shell,
-		opa:       opa,
-		debounce:  debounce,
-		onAdmit:   onAdmit,
-		pending:   make(map[string]time.Time),
+		cfg:        cfg,
+		skillDirs:  skillDirs,
+		mcpDirs:    mcpDirs,
+		pluginDirs: pluginDirs,
+		store:      store,
+		logger:     logger,
+		shell:      shell,
+		opa:        opa,
+		debounce:   debounce,
+		onAdmit:    onAdmit,
+		pending:    make(map[string]time.Time),
 	}
 }
 
@@ -119,6 +122,14 @@ func (w *InstallWatcher) Run(ctx context.Context) error {
 		}
 		watched++
 		fmt.Printf("[watch] monitoring MCP dir:   %s\n", dir)
+	}
+	for _, dir := range w.pluginDirs {
+		if err := ensureAndWatch(fsw, dir); err != nil {
+			fmt.Fprintf(os.Stderr, "[watch] plugin dir %s: %v (skipping)\n", dir, err)
+			continue
+		}
+		watched++
+		fmt.Printf("[watch] monitoring plugin dir: %s\n", dir)
 	}
 
 	if watched == 0 {
@@ -192,11 +203,18 @@ func (w *InstallWatcher) processPending(ctx context.Context) {
 
 func (w *InstallWatcher) classifyEvent(path string) InstallEvent {
 	installType := InstallSkill
+	pathAbs, _ := filepath.Abs(path)
 	for _, dir := range w.mcpDirs {
 		abs, _ := filepath.Abs(dir)
-		pathAbs, _ := filepath.Abs(path)
 		if strings.HasPrefix(pathAbs, abs) {
 			installType = InstallMCP
+			break
+		}
+	}
+	for _, dir := range w.pluginDirs {
+		abs, _ := filepath.Abs(dir)
+		if strings.HasPrefix(pathAbs, abs) {
+			installType = InstallPlugin
 			break
 		}
 	}
@@ -421,6 +439,8 @@ func (w *InstallWatcher) scannerFor(evt InstallEvent) scanner.Scanner {
 		return scanner.NewSkillScanner(w.cfg.Scanners.SkillScanner)
 	case InstallMCP:
 		return scanner.NewMCPScanner(w.cfg.Scanners.MCPScanner)
+	case InstallPlugin:
+		return scanner.NewPluginScanner(w.cfg.Scanners.PluginScanner)
 	default:
 		return nil
 	}
@@ -437,6 +457,11 @@ func (w *InstallWatcher) enforceBlock(evt InstallEvent) {
 	case InstallMCP:
 		me := enforce.NewMCPEnforcer(w.shell)
 		_ = me.BlockEndpoint(evt.Name)
+	case InstallPlugin:
+		pe := enforce.NewPluginEnforcer(w.cfg.QuarantineDir, w.shell)
+		if _, err := pe.Quarantine(evt.Path); err != nil {
+			fmt.Fprintf(os.Stderr, "[watch] quarantine plugin %s: %v\n", evt.Path, err)
+		}
 	}
 }
 
@@ -460,6 +485,12 @@ func (w *InstallWatcher) isDirectChildDir(path string) bool {
 		}
 	}
 	for _, dir := range w.mcpDirs {
+		dirAbs, _ := filepath.Abs(dir)
+		if parentAbs == dirAbs {
+			return true
+		}
+	}
+	for _, dir := range w.pluginDirs {
 		dirAbs, _ := filepath.Abs(dir)
 		if parentAbs == dirAbs {
 			return true

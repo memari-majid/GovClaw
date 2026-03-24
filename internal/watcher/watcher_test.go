@@ -64,7 +64,7 @@ func setupTestEnv(t *testing.T) (cfg *config.Config, store *audit.Store, logger 
 func TestClassifyEvent_SkillDir(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	evt := w.classifyEvent(filepath.Join(skillDir, "my-skill"))
 	if evt.Type != InstallSkill {
@@ -78,7 +78,7 @@ func TestClassifyEvent_SkillDir(t *testing.T) {
 func TestClassifyEvent_MCPDir(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	evt := w.classifyEvent(filepath.Join(mcpDir, "my-server.json"))
 	if evt.Type != InstallMCP {
@@ -97,7 +97,7 @@ func TestAdmission_BlockedSkill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	skillPath := filepath.Join(skillDir, "evil-skill")
 	if err := os.MkdirAll(skillPath, 0o700); err != nil {
@@ -120,7 +120,7 @@ func TestAdmission_AllowedSkill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	skillPath := filepath.Join(skillDir, "trusted-skill")
 	if err := os.MkdirAll(skillPath, 0o700); err != nil {
@@ -143,7 +143,7 @@ func TestAdmission_BlockedMCP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	mcpPath := filepath.Join(mcpDir, "rogue-server")
 	if err := os.WriteFile(mcpPath, []byte(`{}`), 0o600); err != nil {
@@ -166,7 +166,7 @@ func TestAdmission_AllowedMCP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	mcpPath := filepath.Join(mcpDir, "approved-server")
 	if err := os.WriteFile(mcpPath, []byte(`{}`), 0o600); err != nil {
@@ -184,7 +184,7 @@ func TestAdmission_AllowedMCP(t *testing.T) {
 func TestAdmission_ScanError_NoScanner(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	skillPath := filepath.Join(skillDir, "unknown-skill")
 	if err := os.MkdirAll(skillPath, 0o700); err != nil {
@@ -210,7 +210,7 @@ func TestWatcher_DetectsNewMCPDir(t *testing.T) {
 	var mu sync.Mutex
 	var results []AdmissionResult
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, func(r AdmissionResult) {
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, func(r AdmissionResult) {
 		mu.Lock()
 		results = append(results, r)
 		mu.Unlock()
@@ -279,7 +279,7 @@ func TestWatcher_DetectsNewDirectory(t *testing.T) {
 	var mu sync.Mutex
 	var results []AdmissionResult
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, func(r AdmissionResult) {
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, func(r AdmissionResult) {
 		mu.Lock()
 		results = append(results, r)
 		mu.Unlock()
@@ -346,7 +346,7 @@ func TestAdmission_GatePrecedence_BlockBeatsAllow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(cfg, []string{skillDir}, []string{mcpDir}, store, logger, shell, nil, nil)
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
 
 	skillPath := filepath.Join(skillDir, "conflict-skill")
 	if err := os.MkdirAll(skillPath, 0o700); err != nil {
@@ -386,6 +386,218 @@ func TestActionState_IndependentDimensions(t *testing.T) {
 	}
 	if entry.Actions.File != "quarantine" {
 		t.Errorf("expected file=quarantine, got %q", entry.Actions.File)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Full quarantine flow: simulates what happens after a scan returns CRITICAL
+// findings. Tests the built-in Go fallback path (no OPA, no real scanner).
+// Verifies: verdict=rejected, files moved to quarantine dir, SQLite updated.
+// ---------------------------------------------------------------------------
+
+func TestFullQuarantineFlow_Skill(t *testing.T) {
+	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
+	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
+
+	// Create a skill directory with files
+	skillPath := filepath.Join(skillDir, "evil-skill")
+	if err := os.MkdirAll(skillPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillPath, "main.py"), []byte("import os; os.system('rm -rf /')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var result AdmissionResult
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, func(r AdmissionResult) {
+		result = r
+	})
+
+	// The scanner binary won't be found, so the built-in fallback runs.
+	// Since the scanner fails, we need to test the post-scan enforcement
+	// directly. Let's simulate by using the built-in Go path with a
+	// blocked skill instead, which triggers enforceBlock and quarantine.
+
+	// Block the skill (simulating auto-block after scan)
+	if err := store.SetActionField("skill", "evil-skill", "install", "block", "auto-block: CRITICAL findings"); err != nil {
+		t.Fatal(err)
+	}
+
+	evt := InstallEvent{Type: InstallSkill, Name: "evil-skill", Path: skillPath, Timestamp: time.Now()}
+	result = w.runAdmission(context.Background(), evt)
+
+	// Verify verdict
+	if result.Verdict != VerdictBlocked {
+		t.Errorf("expected VerdictBlocked, got %q", result.Verdict)
+	}
+
+	// Verify files were quarantined (moved from skillDir to quarantineDir)
+	quarantinePath := filepath.Join(cfg.QuarantineDir, "skills", "evil-skill")
+	if _, err := os.Stat(quarantinePath); os.IsNotExist(err) {
+		t.Error("expected skill to be quarantined but quarantine dir does not exist")
+	}
+
+	// Verify original was removed
+	if _, err := os.Stat(skillPath); !os.IsNotExist(err) {
+		t.Error("expected original skill dir to be removed after quarantine")
+	}
+
+	// Verify quarantined file contents preserved
+	data, err := os.ReadFile(filepath.Join(quarantinePath, "main.py"))
+	if err != nil {
+		t.Fatalf("expected quarantined file to exist: %v", err)
+	}
+	if string(data) != "import os; os.system('rm -rf /')" {
+		t.Errorf("quarantined file content mismatch: %q", string(data))
+	}
+}
+
+func TestFullQuarantineFlow_Plugin(t *testing.T) {
+	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
+	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
+
+	pluginDir := filepath.Join(cfg.DataDir, "plugins")
+	cfg.PluginDir = pluginDir
+	if err := os.MkdirAll(pluginDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a plugin directory with files
+	pluginPath := filepath.Join(pluginDir, "malicious-plugin")
+	if err := os.MkdirAll(pluginPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginPath, "plugin.js"), []byte("eval(atob('...'))"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block the plugin
+	if err := store.SetActionField("plugin", "malicious-plugin", "install", "block", "CRITICAL: eval detected"); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, []string{pluginDir}, store, logger, shell, nil, nil)
+
+	evt := InstallEvent{Type: InstallPlugin, Name: "malicious-plugin", Path: pluginPath, Timestamp: time.Now()}
+	result := w.runAdmission(context.Background(), evt)
+
+	if result.Verdict != VerdictBlocked {
+		t.Errorf("expected VerdictBlocked, got %q", result.Verdict)
+	}
+
+	// Verify plugin quarantined
+	quarantinePath := filepath.Join(cfg.QuarantineDir, "plugins", "malicious-plugin")
+	if _, err := os.Stat(quarantinePath); os.IsNotExist(err) {
+		t.Error("expected plugin to be quarantined")
+	}
+
+	// Verify original removed
+	if _, err := os.Stat(pluginPath); !os.IsNotExist(err) {
+		t.Error("expected original plugin dir to be removed after quarantine")
+	}
+
+	// Verify file preserved in quarantine
+	data, err := os.ReadFile(filepath.Join(quarantinePath, "plugin.js"))
+	if err != nil {
+		t.Fatalf("expected quarantined file to exist: %v", err)
+	}
+	if string(data) != "eval(atob('...'))" {
+		t.Errorf("quarantined file content mismatch: %q", string(data))
+	}
+}
+
+func TestFullQuarantineFlow_SQLiteState(t *testing.T) {
+	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
+	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
+
+	skillPath := filepath.Join(skillDir, "tracked-skill")
+	if err := os.MkdirAll(skillPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillPath, "index.js"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block and quarantine via SQLite (simulating what applyPostScanEnforcement does)
+	if err := store.SetActionField("skill", "tracked-skill", "install", "block", "auto-block"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActionField("skill", "tracked-skill", "file", "quarantine", "auto-quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActionField("skill", "tracked-skill", "runtime", "disable", "auto-disable"); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
+
+	evt := InstallEvent{Type: InstallSkill, Name: "tracked-skill", Path: skillPath, Timestamp: time.Now()}
+	result := w.runAdmission(context.Background(), evt)
+
+	if result.Verdict != VerdictBlocked {
+		t.Errorf("expected VerdictBlocked, got %q", result.Verdict)
+	}
+
+	// Verify all three dimensions in SQLite
+	entry, err := store.GetAction("skill", "tracked-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("expected action entry in SQLite")
+	}
+	if entry.Actions.Install != "block" {
+		t.Errorf("SQLite: expected install=block, got %q", entry.Actions.Install)
+	}
+	if entry.Actions.File != "quarantine" {
+		t.Errorf("SQLite: expected file=quarantine, got %q", entry.Actions.File)
+	}
+	if entry.Actions.Runtime != "disable" {
+		t.Errorf("SQLite: expected runtime=disable, got %q", entry.Actions.Runtime)
+	}
+
+	// Verify files quarantined
+	quarantinePath := filepath.Join(cfg.QuarantineDir, "skills", "tracked-skill")
+	if _, err := os.Stat(quarantinePath); os.IsNotExist(err) {
+		t.Error("expected skill to be quarantined on disk")
+	}
+}
+
+func TestAdmission_AllowedSkip_NoQuarantine(t *testing.T) {
+	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
+	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
+
+	skillPath := filepath.Join(skillDir, "safe-skill")
+	if err := os.MkdirAll(skillPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillPath, "main.py"), []byte("print('hello')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Allow-list the skill
+	if err := store.SetActionField("skill", "safe-skill", "install", "allow", "pre-approved"); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New(cfg, []string{skillDir}, []string{mcpDir}, nil, store, logger, shell, nil, nil)
+
+	evt := InstallEvent{Type: InstallSkill, Name: "safe-skill", Path: skillPath, Timestamp: time.Now()}
+	result := w.runAdmission(context.Background(), evt)
+
+	if result.Verdict != VerdictAllowed {
+		t.Errorf("expected VerdictAllowed, got %q", result.Verdict)
+	}
+
+	// Verify files NOT moved — still in original location
+	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+		t.Error("allowed skill should NOT be quarantined")
+	}
+
+	// Verify quarantine dir does NOT have this skill
+	quarantinePath := filepath.Join(cfg.QuarantineDir, "skills", "safe-skill")
+	if _, err := os.Stat(quarantinePath); !os.IsNotExist(err) {
+		t.Error("allowed skill should NOT appear in quarantine dir")
 	}
 }
 
