@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from defenseclaw.models import Finding, ScanResult
 
@@ -71,7 +71,7 @@ class PluginScannerWrapper:
         return ScanResult(
             scanner="plugin-scanner",
             target=target,
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             findings=findings,
             duration=timedelta(seconds=elapsed),
         )

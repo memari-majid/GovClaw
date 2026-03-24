@@ -10,7 +10,7 @@ import json
 import subprocess
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from defenseclaw.models import Finding, ScanResult
@@ -59,6 +59,6 @@ class AIBOMScannerWrapper:
         return ScanResult(
             scanner="aibom",
             target=target,
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             findings=findings,
         )

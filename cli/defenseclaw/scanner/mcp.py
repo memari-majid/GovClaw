@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from defenseclaw.models import Finding, ScanResult
 
@@ -55,6 +55,6 @@ class MCPScannerWrapper:
         return ScanResult(
             scanner="mcp-scanner",
             target=target,
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             findings=findings,
         )

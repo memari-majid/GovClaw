@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from defenseclaw.config import SkillScannerConfig
@@ -130,7 +130,7 @@ class SkillScannerWrapper:
         return ScanResult(
             scanner="skill-scanner",
             target=target,
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             findings=findings,
             duration=timedelta(seconds=elapsed),
         )

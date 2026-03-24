@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from defenseclaw.models import ActionEntry, ActionState, Counts, Event
@@ -133,7 +133,7 @@ class Store:
         if not event.id:
             event.id = str(uuid.uuid4())
         if event.timestamp is None:
-            event.timestamp = datetime.now(UTC)
+            event.timestamp = datetime.now(timezone.utc)
         if not event.actor:
             event.actor = "defenseclaw"
         self.db.execute(
@@ -235,7 +235,7 @@ class Store:
     ) -> None:
         actions_json = json.dumps(state.to_dict())
         aid = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.db.execute(
             """INSERT INTO actions (id, target_type, target_name, source_path, actions_json, reason, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -255,7 +255,7 @@ class Store:
     ) -> None:
         _validate(field, value)
         aid = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         init_json = json.dumps({field: value})
         path = f"$.{field}"
         self.db.execute(
@@ -272,7 +272,7 @@ class Store:
     def clear_action_field(self, target_type: str, target_name: str, field: str) -> None:
         _validate(field, "")
         path = f"$.{field}"
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.db.execute(
             """UPDATE actions SET actions_json = json_remove(actions_json, ?), updated_at = ?
                WHERE target_type = ? AND target_name = ?""",
@@ -421,4 +421,4 @@ def _parse_ts(val: Any) -> datetime:
                 return datetime.strptime(val, fmt)
             except ValueError:
                 continue
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)

@@ -104,7 +104,7 @@ class TestAibomCommand(unittest.TestCase):
             scanner="aibom", target=".", timestamp=datetime.now(timezone.utc),
         )
 
-        result = _invoke(aibom, ["."], app=_make_app())
+        result = _invoke(aibom, ["generate", "."], app=_make_app())
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Generating AIBOM", result.output)
 
@@ -118,7 +118,7 @@ class TestAibomCommand(unittest.TestCase):
             findings=[Finding(id="f1", severity="INFO", title="Inventory")],
         )
 
-        result = _invoke(aibom, [".", "--json"], app=_make_app())
+        result = _invoke(aibom, ["generate", ".", "--json"], app=_make_app())
         self.assertEqual(result.exit_code, 0)
         self.assertIn('"scanner": "aibom"', result.output)
 
@@ -130,7 +130,7 @@ class TestAibomCommand(unittest.TestCase):
         mock_instance.scan.side_effect = RuntimeError("scan broke")
 
         runner = CliRunner()
-        result = runner.invoke(aibom, ["."], obj=_make_app())
+        result = runner.invoke(aibom, ["generate", "."], obj=_make_app())
         self.assertNotEqual(result.exit_code, 0)
 
 

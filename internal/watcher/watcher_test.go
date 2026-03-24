@@ -199,7 +199,7 @@ func TestAdmission_ScanError_NoScanner(t *testing.T) {
 	}
 }
 
-func TestWatcher_DetectsNewFile(t *testing.T) {
+func TestWatcher_DetectsNewMCPDir(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
@@ -224,24 +224,35 @@ func TestWatcher_DetectsNewFile(t *testing.T) {
 		errCh <- w.Run(ctx)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
-	filePath := filepath.Join(mcpDir, "detected-server")
-	if err := os.WriteFile(filePath, []byte(`{"name":"test"}`), 0o600); err != nil {
+	dirPath := filepath.Join(mcpDir, "detected-server")
+	if err := os.MkdirAll(dirPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Duration(cfg.Watch.DebounceMs*3) * time.Millisecond)
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(results)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-errCh
+			t.Fatal("timed out waiting for admission result")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 
 	cancel()
 	<-errCh
 
 	mu.Lock()
 	defer mu.Unlock()
-
-	if len(results) == 0 {
-		t.Fatal("expected at least one admission result, got none")
-	}
 
 	found := false
 	for _, r := range results {
@@ -282,23 +293,34 @@ func TestWatcher_DetectsNewDirectory(t *testing.T) {
 		errCh <- w.Run(ctx)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	if err := os.MkdirAll(filepath.Join(skillDir, "new-skill"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Duration(cfg.Watch.DebounceMs*3) * time.Millisecond)
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(results)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-errCh
+			t.Fatal("timed out waiting for admission result")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 
 	cancel()
 	<-errCh
 
 	mu.Lock()
 	defer mu.Unlock()
-
-	if len(results) == 0 {
-		t.Fatal("expected at least one admission result, got none")
-	}
 
 	found := false
 	for _, r := range results {

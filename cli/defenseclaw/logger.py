@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from defenseclaw.db import Store
 from defenseclaw.models import Event, ScanResult
@@ -36,7 +36,7 @@ class Logger:
             )
 
         event = Event(
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             action="scan",
             target=result.target,
             details=(
@@ -49,7 +49,7 @@ class Logger:
 
     def log_action(self, action: str, target: str, details: str) -> None:
         event = Event(
-            timestamp=datetime.now(UTC),
+            timestamp=datetime.now(timezone.utc),
             action=action,
             target=target,
             details=details,
