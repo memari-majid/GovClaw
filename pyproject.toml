@@ -17,7 +17,7 @@ tui = ["textual>=0.50"]
 # Pin litellm via direct wheel: PyPI simple index lists litellm as quarantined (no file links).
 skill-scan = [
     "cisco-ai-skill-scanner>=2.0",
-    "litellm @ https://files.pythonhosted.org/packages/53/4d/73fdb12223bdb01889134eb75525fcc768b1724255f2b87072dd6743c6e1/litellm-1.80.16-py3-none-any.whl",
+    "litellm==1.80.16",
 ]
 
 [dependency-groups]

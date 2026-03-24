@@ -20,15 +20,28 @@ export function maxSeverity(items: readonly Severity[]): Severity {
   return max;
 }
 
+export interface TaxonomyRef {
+  objective: string;      // e.g. "OB-009"
+  technique: string;      // e.g. "AITech-9.3"
+  sub_technique?: string; // e.g. "AISubtech-9.3.1"
+}
+
 export interface Finding {
   id: string;
+  rule_id?: string;
   severity: Severity;
+  confidence?: number;
   title: string;
   description: string;
+  evidence?: string;
   location?: string;
   remediation?: string;
   scanner: string;
   tags?: string[];
+  taxonomy?: TaxonomyRef;
+  occurrence_count?: number;
+  suppressed?: boolean;
+  suppression_reason?: string;
 }
 
 export interface ScanMetadata {
@@ -41,6 +54,23 @@ export interface ScanMetadata {
   detected_capabilities: string[];
 }
 
+export type CategoryStatus = "pass" | "info" | "warn" | "fail";
+
+export interface AssessmentCategory {
+  name: string;
+  status: CategoryStatus;
+  summary: string;
+}
+
+export type ScanVerdict = "benign" | "suspicious" | "malicious" | "unknown";
+
+export interface Assessment {
+  verdict: ScanVerdict;
+  confidence: number;
+  summary: string;
+  categories: AssessmentCategory[];
+}
+
 export interface ScanResult {
   scanner: string;
   target: string;
@@ -48,6 +78,7 @@ export interface ScanResult {
   findings: Finding[];
   duration_ns?: number;
   metadata?: ScanMetadata;
+  assessment?: Assessment;
 }
 
 export interface ScanReport {
@@ -140,4 +171,10 @@ export interface MCPServerConfig {
   transport?: "stdio" | "http" | "sse";
   tools?: ToolManifest[];
   enabled?: boolean;
+}
+
+export type ScanProfile = "default" | "strict";
+
+export interface PluginScanOptions {
+  profile?: ScanProfile;
 }

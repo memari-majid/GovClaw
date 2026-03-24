@@ -43,11 +43,14 @@ func (p *MCPsPanel) Refresh() {
 		return
 	}
 	for _, e := range entries {
-		status := "active"
-		if e.Actions.Install == "block" {
+		var status string
+		switch e.Actions.Install {
+		case "block":
 			status = "blocked"
-		} else if e.Actions.Install == "allow" {
+		case "allow":
 			status = "allowed"
+		default:
+			status = "active"
 		}
 		p.items = append(p.items, mcpItem{
 			URL:     e.TargetName,

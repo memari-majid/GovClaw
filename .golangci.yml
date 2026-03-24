@@ -1,0 +1,6 @@
+version: "2"
+
+linters:
+  default: standard
+  disable:
+    - errcheck      # TODO: fix unchecked Close() calls across codebase

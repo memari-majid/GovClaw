@@ -37,7 +37,11 @@ class SkillScannerWrapper:
         except ImportError:
             print(
                 "error: cisco-ai-skill-scanner not installed.\n"
-                "  Install with: pip install cisco-ai-skill-scanner",
+                "  Install with: pip install cisco-ai-skill-scanner\n"
+                "\n"
+                "  Note: If installation fails due to litellm dependency,\n"
+                "  the package may be temporarily unavailable on PyPI.\n"
+                "  Check https://pypi.org/project/litellm/ for status.",
                 file=sys.stderr,
             )
             raise SystemExit(1)

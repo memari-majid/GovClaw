@@ -28,7 +28,7 @@ import { spawn, execFile } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { DaemonClient } from "./client.js";
 import { PolicyEnforcer } from "./policy/enforcer.js";
-import { scanPlugin } from "./scanners/plugin-scanner.js";
+import { scanPlugin } from "./scanners/plugin_scanner/index.js";
 import { scanMCPServer } from "./scanners/mcp-scanner.js";
 import type {
   ScanResult,
