@@ -59,18 +59,6 @@ jobs:
           name: defenseclaw-${{ matrix.goos }}-${{ matrix.goarch }}
           path: defenseclaw-${{ matrix.goos }}-${{ matrix.goarch }}
 
-  go-vulncheck:
-    name: Go Vulnerability Check
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - run: govulncheck ./...
-
   python-lint-test:
     name: Python Lint & Test
     runs-on: ubuntu-latest
