@@ -172,7 +172,7 @@ function normalizeManifest(
   }
 
   if (Array.isArray(raw["tools"])) {
-    manifest.tools = raw["tools"] as import("../types.js").ToolManifest[];
+    manifest.tools = raw["tools"] as import("../../types.js").ToolManifest[];
   }
 
   if (Array.isArray(raw["commands"])) {
