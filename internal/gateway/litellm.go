@@ -153,8 +153,26 @@ func (l *LiteLLMProcess) buildEnv() []string {
 	}
 	filtered = append(filtered, "PYTHONPATH="+pythonPath)
 	filtered = append(filtered, "DEFENSECLAW_GUARDRAIL_MODE="+l.cfg.Mode)
+	if l.cfg.ScannerMode != "" {
+		filtered = append(filtered, "DEFENSECLAW_SCANNER_MODE="+l.cfg.ScannerMode)
+	}
 	if l.apiPort > 0 {
 		filtered = append(filtered, fmt.Sprintf("DEFENSECLAW_API_PORT=%d", l.apiPort))
+	}
+
+	if l.cfg.ScannerMode == "remote" || l.cfg.ScannerMode == "both" {
+		if l.cfg.CiscoAIDefense.Endpoint != "" {
+			filtered = append(filtered, "CISCO_AI_DEFENSE_ENDPOINT="+l.cfg.CiscoAIDefense.Endpoint)
+		}
+		if l.cfg.CiscoAIDefense.APIKeyEnv != "" {
+			filtered = append(filtered, "CISCO_AI_DEFENSE_API_KEY_ENV="+l.cfg.CiscoAIDefense.APIKeyEnv)
+		}
+		if l.cfg.CiscoAIDefense.TimeoutMs > 0 {
+			filtered = append(filtered, fmt.Sprintf("CISCO_AI_DEFENSE_TIMEOUT_MS=%d", l.cfg.CiscoAIDefense.TimeoutMs))
+		}
+		if len(l.cfg.CiscoAIDefense.EnabledRules) > 0 {
+			filtered = append(filtered, "CISCO_AI_DEFENSE_ENABLED_RULES="+strings.Join(l.cfg.CiscoAIDefense.EnabledRules, ","))
+		}
 	}
 
 	return filtered

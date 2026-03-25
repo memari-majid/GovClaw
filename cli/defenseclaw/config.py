@@ -194,9 +194,18 @@ class FirewallConfig:
 
 
 @dataclass
+class CiscoAIDefenseConfig:
+    endpoint: str = "https://us.api.inspect.aidefense.security.cisco.com"
+    api_key_env: str = "CISCO_AI_DEFENSE_API_KEY"
+    timeout_ms: int = 3000
+    enabled_rules: list[str] = field(default_factory=list)
+
+
+@dataclass
 class GuardrailConfig:
     enabled: bool = False
     mode: str = "observe"           # observe | action
+    scanner_mode: str = "local"     # local | remote | both
     port: int = 4000
     model: str = ""                 # upstream model, e.g. "anthropic/claude-opus-4-5"
     model_name: str = ""            # alias exposed to OpenClaw, e.g. "claude-opus"
@@ -204,6 +213,7 @@ class GuardrailConfig:
     guardrail_dir: str = ""         # directory containing guardrail module (must match litellm_config dir)
     litellm_config: str = ""        # path to generated litellm_config.yaml
     original_model: str = ""        # original OpenClaw model (for revert)
+    cisco_ai_defense: CiscoAIDefenseConfig = field(default_factory=CiscoAIDefenseConfig)
 
 
 @dataclass
@@ -313,6 +323,17 @@ def _merge_skill_actions(raw: dict[str, Any] | None) -> SkillActionsConfig:
     )
 
 
+def _merge_cisco_ai_defense(raw: dict[str, Any] | None) -> CiscoAIDefenseConfig:
+    if not raw:
+        return CiscoAIDefenseConfig()
+    return CiscoAIDefenseConfig(
+        endpoint=raw.get("endpoint", "https://us.api.inspect.aidefense.security.cisco.com"),
+        api_key_env=raw.get("api_key_env", "CISCO_AI_DEFENSE_API_KEY"),
+        timeout_ms=raw.get("timeout_ms", 3000),
+        enabled_rules=raw.get("enabled_rules", []),
+    )
+
+
 def _merge_guardrail(raw: dict[str, Any] | None, data_dir: str) -> GuardrailConfig:
     if not raw:
         return GuardrailConfig(
@@ -322,6 +343,7 @@ def _merge_guardrail(raw: dict[str, Any] | None, data_dir: str) -> GuardrailConf
     return GuardrailConfig(
         enabled=raw.get("enabled", False),
         mode=raw.get("mode", "observe"),
+        scanner_mode=raw.get("scanner_mode", "local"),
         port=raw.get("port", 4000),
         model=raw.get("model", ""),
         model_name=raw.get("model_name", ""),
@@ -329,6 +351,7 @@ def _merge_guardrail(raw: dict[str, Any] | None, data_dir: str) -> GuardrailConf
         guardrail_dir=raw.get("guardrail_dir", data_dir),
         litellm_config=raw.get("litellm_config", os.path.join(data_dir, "litellm_config.yaml")),
         original_model=raw.get("original_model", ""),
+        cisco_ai_defense=_merge_cisco_ai_defense(raw.get("cisco_ai_defense")),
     )
 
 

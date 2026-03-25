@@ -65,5 +65,65 @@
   "sandbox": {
     "default_permissions": [],
     "denied_endpoints_global": []
+  },
+  "guardrail": {
+    "severity_rank": {
+      "NONE": 0,
+      "LOW": 1,
+      "MEDIUM": 2,
+      "HIGH": 3,
+      "CRITICAL": 4
+    },
+    "block_threshold": 3,
+    "alert_threshold": 2,
+    "cisco_trust_level": "full",
+    "patterns": {
+      "injection": [
+        "ignore previous",
+        "ignore all instructions",
+        "ignore above",
+        "disregard previous",
+        "disregard all",
+        "you are now",
+        "act as",
+        "pretend you are",
+        "bypass",
+        "jailbreak",
+        "do anything now",
+        "dan mode"
+      ],
+      "secrets": [
+        "sk-",
+        "sk-ant-",
+        "sk-proj-",
+        "api_key=",
+        "apikey=",
+        "-----begin rsa",
+        "-----begin private",
+        "-----begin openssh",
+        "aws_access_key",
+        "aws_secret_access",
+        "password=",
+        "token:",
+        "bearer ",
+        "ghp_",
+        "gho_",
+        "github_pat_"
+      ],
+      "exfiltration": [
+        "/etc/passwd",
+        "/etc/shadow",
+        "base64 -d",
+        "base64 --decode",
+        "exfiltrate",
+        "send to my server",
+        "curl http"
+      ]
+    },
+    "severity_mappings": {
+      "injection": "HIGH",
+      "secrets": "MEDIUM",
+      "exfiltration": "HIGH"
+    }
   }
 }

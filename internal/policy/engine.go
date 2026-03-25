@@ -81,6 +81,60 @@ func (e *Engine) Evaluate(ctx context.Context, input AdmissionInput) (*Admission
 	return out, nil
 }
 
+// EvaluateGuardrail runs the LLM guardrail policy against combined scanner results.
+func (e *Engine) EvaluateGuardrail(ctx context.Context, input GuardrailInput) (*GuardrailOutput, error) {
+	modules, err := e.loadModules()
+	if err != nil {
+		return nil, err
+	}
+
+	inputMap, err := toMap(input)
+	if err != nil {
+		return nil, fmt.Errorf("policy: marshal guardrail input: %w", err)
+	}
+
+	opts := []func(*rego.Rego){
+		rego.Query("data.defenseclaw.guardrail"),
+		rego.Store(e.store),
+		rego.Input(inputMap),
+	}
+	for name, src := range modules {
+		opts = append(opts, rego.Module(name, src))
+	}
+
+	rs, err := rego.New(opts...).Eval(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("policy: guardrail eval: %w", err)
+	}
+
+	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
+		return nil, fmt.Errorf("policy: guardrail empty result set")
+	}
+
+	result, ok := rs[0].Expressions[0].Value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("policy: guardrail unexpected result type %T", rs[0].Expressions[0].Value)
+	}
+
+	sources := []string{}
+	if raw, ok := result["scanner_sources"]; ok {
+		if arr, ok := raw.([]interface{}); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok {
+					sources = append(sources, s)
+				}
+			}
+		}
+	}
+
+	return &GuardrailOutput{
+		Action:         stringVal(result, "action"),
+		Severity:       stringVal(result, "severity"),
+		Reason:         stringVal(result, "reason"),
+		ScannerSources: sources,
+	}, nil
+}
+
 // Compile performs a one-time compilation check of the Rego modules,
 // useful for fast-failing at startup.
 func (e *Engine) Compile() error {

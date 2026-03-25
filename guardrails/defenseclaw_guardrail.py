@@ -5,18 +5,28 @@ Operates in two modes (set via DEFENSECLAW_GUARDRAIL_MODE env var):
 
   observe  — log findings, never block (default)
   action   — block prompts/responses that match security policies
+
+Scanner mode (set via DEFENSECLAW_SCANNER_MODE env var):
+
+  local    — only local pattern matching (default)
+  remote   — only Cisco AI Defense cloud API
+  both     — local first; if clean, run remote as second layer
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from litellm.integrations.custom_guardrail import CustomGuardrail
+try:
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+except ModuleNotFoundError:
+    CustomGuardrail = object  # type: ignore[misc,assignment]
 
 if TYPE_CHECKING:
     from litellm.caching.caching import DualCache
@@ -49,16 +59,238 @@ EXFIL_PATTERNS = [
     "exfiltrate", "send to my server", "curl http",
 ]
 
+_SEVERITY_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+_CISCO_SEVERITY_MAP = {
+    "NONE_SEVERITY": "NONE",
+    "LOW": "LOW",
+    "MEDIUM": "MEDIUM",
+    "HIGH": "HIGH",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cisco AI Defense Inspect API client
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ENABLED_RULES: list[dict[str, str]] = [
+    {"rule_name": "Prompt Injection"},
+    {"rule_name": "Harassment"},
+    {"rule_name": "Hate Speech"},
+    {"rule_name": "Profanity"},
+    {"rule_name": "Sexual Content & Exploitation"},
+    {"rule_name": "Social Division & Polarization"},
+    {"rule_name": "Violence & Public Safety Threats"},
+    {"rule_name": "Code Detection"},
+]
+
+
+class CiscoAIDefenseClient:
+    """Calls the Cisco AI Defense Chat Inspection API (/api/v1/inspect/chat).
+
+    API key is read from env var (never hardcoded).  Endpoint is configurable
+    via CISCO_AI_DEFENSE_ENDPOINT (default: US region).
+    """
+
+    def __init__(self) -> None:
+        self.api_key: str = os.environ.get(
+            os.environ.get("CISCO_AI_DEFENSE_API_KEY_ENV", "CISCO_AI_DEFENSE_API_KEY"),
+            "",
+        )
+        self.endpoint: str = os.environ.get(
+            "CISCO_AI_DEFENSE_ENDPOINT",
+            "https://us.api.inspect.aidefense.security.cisco.com",
+        ).rstrip("/")
+        try:
+            self.timeout_s: float = int(os.environ.get("CISCO_AI_DEFENSE_TIMEOUT_MS", "3000")) / 1000.0
+        except (ValueError, TypeError):
+            self.timeout_s = 3.0
+        rules_env = os.environ.get("CISCO_AI_DEFENSE_ENABLED_RULES", "")
+        self.enabled_rules: list[dict[str, str]] = (
+            [{"rule_name": r.strip()} for r in rules_env.split(",") if r.strip()]
+            if rules_env
+            else list(_DEFAULT_ENABLED_RULES)
+        )
+
+    def inspect(self, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Send messages to Cisco AI Defense and return a normalized verdict.
+
+        Returns None on any error (network, auth, timeout) so the caller can
+        fall back to local-only scanning.
+        """
+        if not self.api_key:
+            return None
+
+        chat_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            chat_messages.append({"role": msg.get("role", "user"), "content": content})
+
+        payload: dict[str, Any] = {"messages": chat_messages}
+        if self.enabled_rules:
+            payload["config"] = {"enabled_rules": self.enabled_rules}
+
+        url = f"{self.endpoint}/api/v1/inspect/chat"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Cisco-AI-Defense-API-Key": self.api_key,
+        }
+
+        tried_without_rules = False
+        for _attempt in range(2):
+            try:
+                body = json.dumps(payload).encode()
+                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                resp = urllib.request.urlopen(req, timeout=self.timeout_s)
+                data = json.loads(resp.read().decode())
+                return self._normalize(data)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 400 and not tried_without_rules and "config" in payload:
+                    err_body = exc.read().decode("utf-8", errors="replace").lower()
+                    if "already has rules configured" in err_body or "pre-configured" in err_body:
+                        payload.pop("config", None)
+                        tried_without_rules = True
+                        print(f"  {DIM}[cisco-ai-defense] key has pre-configured rules, retrying without config{RESET}", file=sys.stderr)
+                        continue
+                print(f"  {DIM}[cisco-ai-defense] error: {exc}{RESET}", file=sys.stderr)
+                return None
+            except Exception as exc:
+                print(f"  {DIM}[cisco-ai-defense] error: {exc}{RESET}", file=sys.stderr)
+                return None
+        return None
+
+    @staticmethod
+    def _normalize(data: dict[str, Any]) -> dict[str, Any]:
+        """Map Cisco InspectResponse to DefenseClaw verdict format.
+
+        The API returns: is_safe (bool), action (str e.g. "Block"),
+        classifications (list[str]), rules (list[{rule_name, classification}]).
+        """
+        is_safe = data.get("is_safe", True)
+        api_action = data.get("action", "").lower()
+
+        classifications = [
+            c for c in data.get("classifications", [])
+            if c and c != "NONE_VIOLATION"
+        ]
+        rules_list = data.get("rules", [])
+        rule_names = [
+            r.get("rule_name", "")
+            for r in rules_list
+            if r.get("rule_name") and r.get("classification", "") != "NONE_VIOLATION"
+        ]
+        findings = classifications + rule_names
+
+        if is_safe and api_action != "block":
+            return {
+                "action": "allow",
+                "severity": "NONE",
+                "reason": "",
+                "findings": [],
+                "scanner": "ai-defense",
+            }
+
+        severity = "HIGH" if api_action == "block" else "MEDIUM"
+        action = "block" if api_action == "block" else "alert"
+        reason = f"cisco: {', '.join(findings[:5])}" if findings else "cisco: content flagged"
+        return {
+            "action": action,
+            "severity": severity,
+            "reason": reason,
+            "findings": findings,
+            "scanner": "ai-defense",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Verdict merging
+# ---------------------------------------------------------------------------
+
+def _merge_verdicts(
+    local_result: dict[str, Any] | None,
+    cisco_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge local and Cisco verdicts, taking the higher severity."""
+    if local_result is None and cisco_result is None:
+        return {"action": "allow", "severity": "NONE", "reason": "", "findings": [], "scanner_sources": []}
+
+    if local_result is None:
+        cisco_result.setdefault("scanner_sources", ["ai-defense"])
+        return cisco_result
+    if cisco_result is None:
+        local_result.setdefault("scanner_sources", ["local-pattern"])
+        return local_result
+
+    local_sev = _SEVERITY_RANK.get(local_result.get("severity", "NONE"), 0)
+    cisco_sev = _SEVERITY_RANK.get(cisco_result.get("severity", "NONE"), 0)
+
+    if cisco_sev > local_sev:
+        winner = cisco_result
+    else:
+        winner = local_result
+
+    combined_findings = list(local_result.get("findings", [])) + list(cisco_result.get("findings", []))
+    reasons = []
+    if local_result.get("reason"):
+        reasons.append(local_result["reason"])
+    if cisco_result.get("reason"):
+        reasons.append(cisco_result["reason"])
+
+    return {
+        "action": winner["action"],
+        "severity": winner["severity"],
+        "reason": "; ".join(reasons),
+        "findings": combined_findings,
+        "scanner_sources": ["local-pattern", "ai-defense"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hot-reload: TTL-cached runtime config from sidecar file
+# ---------------------------------------------------------------------------
+
+_runtime_cache: dict[str, Any] = {}
+_runtime_cache_ts: float = 0.0
+_RUNTIME_CACHE_TTL = 5.0
+
+
+def _read_runtime_config() -> dict[str, str]:
+    """Read guardrail_runtime.json with a 5-second TTL cache."""
+    global _runtime_cache, _runtime_cache_ts
+    now = time.monotonic()
+    if now - _runtime_cache_ts < _RUNTIME_CACHE_TTL and _runtime_cache:
+        return _runtime_cache
+
+    data_dir = os.environ.get("DEFENSECLAW_DATA_DIR", os.path.expanduser("~/.defenseclaw"))
+    runtime_file = os.path.join(data_dir, "guardrail_runtime.json")
+    try:
+        with open(runtime_file) as f:
+            _runtime_cache = json.load(f)
+            _runtime_cache_ts = now
+    except (OSError, json.JSONDecodeError):
+        pass
+    return _runtime_cache
+
 
 class DefenseClawGuardrail(CustomGuardrail):
     """LiteLLM custom guardrail for DefenseClaw."""
 
     def __init__(self, **kwargs: Any) -> None:
         self.mode: str = os.getenv("DEFENSECLAW_GUARDRAIL_MODE", "observe")
+        self.scanner_mode: str = os.getenv("DEFENSECLAW_SCANNER_MODE", "local")
+        self._cisco_client: CiscoAIDefenseClient | None = None
+        if self.scanner_mode in ("remote", "both"):
+            self._cisco_client = CiscoAIDefenseClient()
         super().__init__(**kwargs)
 
     # ------------------------------------------------------------------
-    # Inspection
+    # Local pattern scanning
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -66,7 +298,8 @@ class DefenseClawGuardrail(CustomGuardrail):
         lower = text.lower()
         return [p for p in patterns if p in lower]
 
-    def _inspect(self, direction: str, content: str) -> dict[str, Any]:
+    def _scan_local(self, direction: str, content: str) -> dict[str, Any]:
+        """Run local pattern-based scanning."""
         flags: list[str] = []
         if direction == "prompt":
             flags.extend(self._scan_patterns(content, INJECTION_PATTERNS))
@@ -74,7 +307,7 @@ class DefenseClawGuardrail(CustomGuardrail):
         flags.extend(self._scan_patterns(content, SECRET_PATTERNS))
 
         if not flags:
-            return {"action": "allow", "severity": "NONE", "reason": "", "findings": []}
+            return {"action": "allow", "severity": "NONE", "reason": "", "findings": [], "scanner": "local-pattern"}
 
         severity = "HIGH" if any(
             p in flags for p in INJECTION_PATTERNS + EXFIL_PATTERNS
@@ -85,7 +318,119 @@ class DefenseClawGuardrail(CustomGuardrail):
             "severity": severity,
             "reason": f"matched: {', '.join(flags[:5])}",
             "findings": flags,
+            "scanner": "local-pattern",
         }
+
+    # ------------------------------------------------------------------
+    # Multi-scanner orchestrator
+    # ------------------------------------------------------------------
+
+    def _inspect(
+        self,
+        direction: str,
+        content: str,
+        messages: list[dict[str, Any]] | None = None,
+        model: str = "",
+    ) -> dict[str, Any]:
+        """Run scanners according to scanner_mode config.
+
+        local:  only local patterns
+        remote: only Cisco AI Defense
+        both:   local first, skip remote if local already flags
+        """
+        runtime = _read_runtime_config()
+        if runtime.get("mode"):
+            self.mode = runtime["mode"]
+        if runtime.get("scanner_mode"):
+            new_sm = runtime["scanner_mode"]
+            if new_sm != self.scanner_mode:
+                self.scanner_mode = new_sm
+                if new_sm in ("remote", "both") and self._cisco_client is None:
+                    self._cisco_client = CiscoAIDefenseClient()
+                elif new_sm == "local":
+                    self._cisco_client = None
+
+        local_result: dict[str, Any] | None = None
+        cisco_result: dict[str, Any] | None = None
+
+        if self.scanner_mode in ("local", "both"):
+            local_result = self._scan_local(direction, content)
+
+        if self.scanner_mode == "both" and local_result and local_result.get("severity") != "NONE":
+            local_result.setdefault("scanner_sources", ["local-pattern"])
+            return local_result
+
+        if self.scanner_mode in ("remote", "both") and self._cisco_client and messages:
+            cisco_result = self._cisco_client.inspect(messages)
+
+        merged = _merge_verdicts(local_result, cisco_result)
+
+        opa_verdict = self._evaluate_via_sidecar(
+            direction=direction,
+            model=model,
+            local_result=local_result,
+            cisco_result=cisco_result,
+            content_length=len(content),
+        )
+        if opa_verdict:
+            return opa_verdict
+
+        return merged
+
+    # ------------------------------------------------------------------
+    # OPA sidecar evaluation (synchronous)
+    # ------------------------------------------------------------------
+
+    def _evaluate_via_sidecar(
+        self,
+        direction: str,
+        model: str,
+        local_result: dict[str, Any] | None,
+        cisco_result: dict[str, Any] | None,
+        content_length: int,
+    ) -> dict[str, Any] | None:
+        """POST to Go sidecar's OPA guardrail evaluate endpoint.
+
+        Returns the OPA verdict or None if the sidecar is unreachable
+        (falls back to _merge_verdicts).
+        """
+        port = os.environ.get("DEFENSECLAW_API_PORT")
+        if not port:
+            return None
+
+        def _strip_scanner(d: dict[str, Any] | None) -> dict[str, Any] | None:
+            if d is None:
+                return None
+            return {k: v for k, v in d.items() if k != "scanner" and k != "scanner_sources"}
+
+        payload: dict[str, Any] = {
+            "direction": direction,
+            "model": model,
+            "mode": self.mode,
+            "scanner_mode": self.scanner_mode,
+            "local_result": _strip_scanner(local_result),
+            "cisco_result": _strip_scanner(cisco_result),
+            "content_length": content_length,
+        }
+
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{int(port)}/v1/guardrail/evaluate",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-DefenseClaw-Client": "litellm-guardrail",
+                },
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=2)
+            result = json.loads(resp.read().decode())
+            if "action" in result and "severity" in result:
+                return result
+        except Exception:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # PRE-CALL: inspect prompt before it reaches the LLM
@@ -107,7 +452,7 @@ class DefenseClawGuardrail(CustomGuardrail):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         t0 = time.monotonic()
 
-        verdict = self._inspect("prompt", text)
+        verdict = self._inspect("prompt", text, messages, model=model)
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         severity = verdict.get("severity", "NONE")
@@ -161,7 +506,8 @@ class DefenseClawGuardrail(CustomGuardrail):
         usage = getattr(response, "usage", None)
         t0 = time.monotonic()
 
-        verdict = self._inspect("completion", content)
+        response_messages = [{"role": "assistant", "content": content}]
+        verdict = self._inspect("completion", content, response_messages, model=model)
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         severity = verdict.get("severity", "NONE")
@@ -182,6 +528,90 @@ class DefenseClawGuardrail(CustomGuardrail):
 
         if action == "block" and self.mode == "action":
             self._replace_response(response, reason)
+
+    # ------------------------------------------------------------------
+    # STREAMING POST-CALL: inspect streaming response chunks
+    # ------------------------------------------------------------------
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: Any,
+    ):
+        """Inspect streaming responses by buffering chunks and scanning periodically.
+
+        Yields each chunk through unchanged but accumulates text for scanning.
+        Once the stream finishes, runs a final inspection on the full response.
+        """
+        accumulated = ""
+        model = "?"
+        usage = None
+        last_scan_len = 0
+        scan_interval = 500
+
+        async for chunk in response:
+            content_delta = ""
+            if hasattr(chunk, "choices"):
+                for choice in chunk.choices:
+                    delta = getattr(choice, "delta", None)
+                    if delta and getattr(delta, "content", None):
+                        content_delta = delta.content
+
+            if hasattr(chunk, "model") and chunk.model:
+                model = chunk.model
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = chunk.usage
+
+            accumulated += content_delta
+
+            if len(accumulated) - last_scan_len >= scan_interval:
+                mid_verdict = self._scan_local("completion", accumulated)
+                if mid_verdict.get("severity") not in ("NONE", None) and self.mode == "action":
+                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    print(
+                        f"\n{RED}[{ts}] STREAM-BLOCK{RESET} "
+                        f"severity={mid_verdict['severity']} {mid_verdict.get('reason', '')}",
+                        file=sys.stderr,
+                    )
+                    self._report_to_sidecar("completion", model, mid_verdict, 0)
+                    return
+                last_scan_len = len(accumulated)
+
+            yield chunk
+
+        if accumulated:
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            t0 = time.monotonic()
+            response_messages = [{"role": "assistant", "content": accumulated}]
+            verdict = self._inspect("completion", accumulated, response_messages, model=model)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+
+            severity = verdict.get("severity", "NONE")
+            action = verdict.get("action", "allow")
+            reason = verdict.get("reason", "")
+
+            sev_color = GREEN if severity == "NONE" else YELLOW if severity == "MEDIUM" else RED
+            tokens_str = ""
+            if usage:
+                tokens_str = f"  in={getattr(usage, 'prompt_tokens', '?')} out={getattr(usage, 'completion_tokens', '?')}"
+            print(
+                f"\n{BOLD}{GREEN}{'─'*60}{RESET}\n"
+                f"{GREEN}[{ts}]{RESET} {BOLD}STREAM-COMPLETE{RESET}  "
+                f"model={model}{tokens_str}  chars={len(accumulated)}  "
+                f"{DIM}{elapsed_ms:.0f}ms{RESET}",
+                file=sys.stderr,
+            )
+            print(f"  verdict: {sev_color}{severity}{RESET}", file=sys.stderr)
+            if severity != "NONE":
+                print(f"  action={action}  {reason}", file=sys.stderr)
+            print(f"{GREEN}{'─'*60}{RESET}", file=sys.stderr)
+
+            t_in = getattr(usage, "prompt_tokens", None) if usage else None
+            t_out = getattr(usage, "completion_tokens", None) if usage else None
+            self._report_to_sidecar(
+                "completion", model, verdict, elapsed_ms,
+                tokens_in=t_in, tokens_out=t_out,
+            )
 
     # ------------------------------------------------------------------
     # Sidecar telemetry reporter

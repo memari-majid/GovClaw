@@ -381,11 +381,11 @@ function verdictToSeverity(verdict: Verdict): string {
   switch (verdict) {
     case "blocked":
     case "rejected":
-      return "ERROR";
+      return "HIGH";
     case "scan-error":
-      return "WARN";
+      return "MEDIUM";
     case "warning":
-      return "WARN";
+      return "LOW";
     case "allowed":
     case "clean":
       return "INFO";

@@ -151,16 +151,25 @@ type GatewayWatcherConfig struct {
 	Skill   GatewayWatcherSkillConfig `mapstructure:"skill"   yaml:"skill"`
 }
 
+type CiscoAIDefenseConfig struct {
+	Endpoint     string   `mapstructure:"endpoint"       yaml:"endpoint"`
+	APIKeyEnv    string   `mapstructure:"api_key_env"    yaml:"api_key_env"`
+	TimeoutMs    int      `mapstructure:"timeout_ms"     yaml:"timeout_ms"`
+	EnabledRules []string `mapstructure:"enabled_rules"  yaml:"enabled_rules"`
+}
+
 type GuardrailConfig struct {
-	Enabled       bool   `mapstructure:"enabled"         yaml:"enabled"`
-	Mode          string `mapstructure:"mode"             yaml:"mode"`
-	Port          int    `mapstructure:"port"             yaml:"port"`
-	Model         string `mapstructure:"model"            yaml:"model"`
-	ModelName     string `mapstructure:"model_name"       yaml:"model_name"`
-	APIKeyEnv     string `mapstructure:"api_key_env"      yaml:"api_key_env"`
-	GuardrailDir  string `mapstructure:"guardrail_dir"    yaml:"guardrail_dir"`
-	LiteLLMConfig string `mapstructure:"litellm_config"   yaml:"litellm_config"`
-	OriginalModel string `mapstructure:"original_model"   yaml:"original_model"`
+	Enabled        bool                 `mapstructure:"enabled"          yaml:"enabled"`
+	Mode           string               `mapstructure:"mode"             yaml:"mode"`
+	ScannerMode    string               `mapstructure:"scanner_mode"     yaml:"scanner_mode"`
+	Port           int                  `mapstructure:"port"             yaml:"port"`
+	Model          string               `mapstructure:"model"            yaml:"model"`
+	ModelName      string               `mapstructure:"model_name"       yaml:"model_name"`
+	APIKeyEnv      string               `mapstructure:"api_key_env"      yaml:"api_key_env"`
+	GuardrailDir   string               `mapstructure:"guardrail_dir"    yaml:"guardrail_dir"`
+	LiteLLMConfig  string               `mapstructure:"litellm_config"   yaml:"litellm_config"`
+	OriginalModel  string               `mapstructure:"original_model"   yaml:"original_model"`
+	CiscoAIDefense CiscoAIDefenseConfig `mapstructure:"cisco_ai_defense" yaml:"cisco_ai_defense"`
 }
 
 type GatewayConfig struct {
@@ -315,9 +324,14 @@ func setDefaults(dataDir string) {
 
 	viper.SetDefault("guardrail.enabled", false)
 	viper.SetDefault("guardrail.mode", "observe")
+	viper.SetDefault("guardrail.scanner_mode", "local")
 	viper.SetDefault("guardrail.port", 4000)
 	viper.SetDefault("guardrail.guardrail_dir", dataDir)
 	viper.SetDefault("guardrail.litellm_config", filepath.Join(dataDir, "litellm_config.yaml"))
+	viper.SetDefault("guardrail.cisco_ai_defense.endpoint", "https://us.api.inspect.aidefense.security.cisco.com")
+	viper.SetDefault("guardrail.cisco_ai_defense.api_key_env", "CISCO_AI_DEFENSE_API_KEY")
+	viper.SetDefault("guardrail.cisco_ai_defense.timeout_ms", 3000)
+	viper.SetDefault("guardrail.cisco_ai_defense.enabled_rules", []string{})
 
 	viper.SetDefault("gateway.host", "127.0.0.1")
 	viper.SetDefault("gateway.port", 18789)

@@ -143,7 +143,7 @@ supports.
 │                                                                     │
 │  Does NOT:                                                          │
 │  ├── Inspect LLM content (that's the guardrail module's job)       │
-│  └── Talk to the guardrail at runtime (no REST calls between them) │
+│  └── Send REST calls to LiteLLM (receives events from guardrail)  │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -165,15 +165,18 @@ supports.
 │              guardrails/defenseclaw_guardrail.py                    │
 │                                                                     │
 │  Owns:                                                              │
-│  ├── Prompt inspection (injection, exfil patterns)                 │
-│  ├── Response inspection (secrets, PII)                            │
+│  ├── Multi-scanner orchestrator (scanner_mode logic)               │
+│  ├── Local pattern scanning (injection, secrets, exfil)            │
+│  ├── Cisco AI Defense client (urllib, no new deps)                 │
+│  ├── Streaming response inspection (chunk-by-chunk)                │
+│  ├── OPA sidecar evaluation (_evaluate_via_sidecar)                │
+│  ├── Hot-reload (reads guardrail_runtime.json with TTL cache)      │
 │  ├── Block/allow decision per mode                                 │
-│  └── Structured logging (colored terminal output)                  │
+│  └── Structured logging + sidecar telemetry                        │
 │                                                                     │
 │  Does NOT:                                                          │
-│  ├── Make any network calls (all local pattern matching)           │
-│  ├── Access the database or audit store                            │
-│  └── Communicate with the orchestrator at runtime                  │
+│  ├── Access the database or audit store directly                   │
+│  └── Manage its own lifecycle (supervised by orchestrator)          │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -197,7 +200,18 @@ supports.
 
 Mode is set in `~/.defenseclaw/config.yaml` (`guardrail.mode`) and injected
 as `DEFENSECLAW_GUARDRAIL_MODE` env var when the orchestrator spawns LiteLLM.
-Changing mode requires restarting the sidecar.
+
+Mode can be changed at runtime via hot-reload (no restart required):
+
+```bash
+curl -X PATCH http://127.0.0.1:18790/v1/guardrail/config \
+  -H 'Content-Type: application/json' \
+  -H 'X-DefenseClaw-Client: cli' \
+  -d '{"mode": "action"}'
+```
+
+The Go sidecar writes `~/.defenseclaw/guardrail_runtime.json` and the Python
+guardrail reads it with a 5-second TTL cache, applying changes without restart.
 
 ## Detection Patterns
 
@@ -307,31 +321,276 @@ defenseclaw setup guardrail --disable
   4. Restart sidecar for changes to take effect
 ```
 
-## What the Guardrail Does NOT Do
+## Scanner Modes
 
-- **No network calls in the hot path** — all inspection is local pattern
-  matching. No REST calls to the sidecar, no cloud API calls.
-- **No database writes** — the guardrail module logs to stdout only.
-  The sidecar's audit store captures guardrail lifecycle events (start,
-  healthy, crash) but not individual inspection verdicts.
-- **No agent code changes** — OpenClaw sees a standard OpenAI-compatible
-  API endpoint. The routing change is in `openclaw.json` config only.
-- **No secret storage** — API keys stay in environment variables. The
-  `litellm_config.yaml` references `os.environ/ANTHROPIC_API_KEY`, not
-  the key itself.
+The guardrail supports three scanner modes, configured via
+`guardrail.scanner_mode` in `config.yaml` (injected as
+`DEFENSECLAW_SCANNER_MODE` env var):
+
+| Mode | Behavior |
+|------|----------|
+| `local` (default) | Only local pattern matching — no network calls |
+| `remote` | Only Cisco AI Defense cloud API |
+| `both` | Local first; if clean, also run Cisco; if local flags, skip Cisco (saves latency + API cost) |
+
+### Scanner Mode Data Flow (`both`)
+
+```
+                        ┌──────────────┐
+                        │  _inspect()  │
+                        └──────┬───────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │  Local pattern scan  │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │  Local flagged?      │
+                    └──┬──────────────┬───┘
+                    YES│              │NO
+                       │              │
+              Return   │    ┌─────────┴─────────┐
+              local    │    │ Cisco AI Defense   │
+              verdict  │    │ API call           │
+                       │    └─────────┬─────────┘
+                       │              │
+                       │    ┌─────────┴─────────┐
+                       │    │ _merge_verdicts()  │
+                       │    │ (higher severity)  │
+                       │    └─────────┬─────────┘
+                       │              │
+                    ┌──┴──────────────┴───┐
+                    │ _evaluate_via_sidecar│
+                    │ POST /v1/guardrail/  │
+                    │ evaluate (OPA)       │
+                    └──────────┬──────────┘
+                               │
+                        Final verdict
+```
+
+## Cisco AI Defense Integration
+
+The guardrail integrates with Cisco AI Defense's Chat Inspection API
+(`/api/v1/inspect/chat`) for ML-based detection of:
+
+- Prompt injection attacks
+- Jailbreak attempts
+- Data exfiltration / leakage
+- Privacy and compliance violations
+
+Configuration in `config.yaml`:
+
+```yaml
+guardrail:
+  scanner_mode: both
+  cisco_ai_defense:
+    endpoint: "https://us.api.inspect.aidefense.security.cisco.com"
+    api_key_env: "CISCO_AI_DEFENSE_API_KEY"
+    timeout_ms: 3000
+    enabled_rules: []  # empty = send 8 default rules (Prompt Injection, Harassment, etc.)
+```
+
+The API key is **never hardcoded** — it is read from the environment
+variable specified in `api_key_env`.
+
+### Default Enabled Rules
+
+When `enabled_rules` is empty (default), the client sends these 8 rules in
+every API request:
+
+1. Prompt Injection
+2. Harassment
+3. Hate Speech
+4. Profanity
+5. Sexual Content & Exploitation
+6. Social Division & Polarization
+7. Violence & Public Safety Threats
+8. Code Detection
+
+If the API key has pre-configured rules on the Cisco dashboard, the client
+detects the `400 Bad Request` ("already has rules configured") and
+automatically retries without the rules payload.
+
+### Graceful Degradation
+
+- If Cisco API is unreachable or times out → falls back to local-only
+- If Go sidecar is unreachable → uses Python `_merge_verdicts` directly
+- If OPA policy has compile errors → uses built-in severity logic
+
+## OPA Policy Evaluation
+
+When the Go sidecar is reachable, the Python guardrail sends combined
+scanner results to `POST /v1/guardrail/evaluate`. The sidecar evaluates
+the results through the OPA guardrail policy (`policies/rego/guardrail.rego`)
+which decides the final verdict based on configurable:
+
+- **Severity thresholds**: block on HIGH+, alert on MEDIUM+
+- **Cisco trust level**: `full` (trust Cisco verdicts equally), `advisory`
+  (downgrade Cisco-only blocks to alerts), `none` (ignore Cisco results)
+- **Pattern lists**: configurable in `policies/rego/data.json` under
+  `guardrail.patterns`
+
+The OPA verdict is returned synchronously to the Python guardrail for
+real-time block/allow decisions.
+
+## Component Ownership
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DefenseClaw Orchestrator (Go)                    │
+│                                                                     │
+│  Owns:                                                              │
+│  ├── LiteLLM child process (start, monitor health, restart)        │
+│  ├── Config: guardrail.enabled, mode, scanner_mode, port, model    │
+│  ├── Env injection: PYTHONPATH, GUARDRAIL_MODE, SCANNER_MODE,      │
+│  │   CISCO_AI_DEFENSE_* env vars                                   │
+│  ├── Health tracking: guardrail subsystem state                    │
+│  ├── REST API: POST /v1/guardrail/evaluate (OPA policy)            │
+│  └── OTel metrics: scanner attribution, latency, token counts      │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                     LiteLLM Proxy (Python)                          │
+│                                                                     │
+│  Owns:                                                              │
+│  ├── Model routing (litellm_config.yaml)                           │
+│  ├── API key management (reads from env var)                       │
+│  ├── Protocol translation (OpenAI ↔ Anthropic/Google/etc.)         │
+│  └── Guardrail invocation (pre_call + post_call hooks)             │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│              DefenseClaw Guardrail Module (Python)                   │
+│              guardrails/defenseclaw_guardrail.py                    │
+│                                                                     │
+│  Owns:                                                              │
+│  ├── Multi-scanner orchestrator (scanner_mode logic)               │
+│  ├── Local pattern scanning (injection, secrets, exfil)            │
+│  ├── Cisco AI Defense client (urllib.request, no new deps)         │
+│  ├── OPA sidecar evaluation (_evaluate_via_sidecar)                │
+│  ├── Verdict merging (_merge_verdicts)                             │
+│  ├── Block/allow decision per mode                                 │
+│  └── Structured logging + sidecar telemetry                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DefenseClaw CLI (Python)                         │
+│                                                                     │
+│  Owns:                                                              │
+│  ├── `defenseclaw init` — installs LiteLLM + copies guardrail      │
+│  ├── `defenseclaw setup guardrail` — interactive config wizard     │
+│  ├── litellm_config.yaml generation                                │
+│  ├── openclaw.json patching (add LiteLLM provider, reroute model)  │
+│  └── openclaw.json revert on --disable                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## File Layout
+
+```
+guardrails/
+  defenseclaw_guardrail.py          # shipped in repo, copied to ~/.defenseclaw/guardrails/
+
+policies/rego/
+  guardrail.rego                    # OPA policy for LLM guardrail verdicts
+  guardrail_test.rego               # OPA unit tests
+  data.json                         # guardrail section: patterns, thresholds, Cisco trust
+
+cli/defenseclaw/
+  guardrail.py                      # config generation, openclaw.json patching
+  commands/cmd_setup.py             # `setup guardrail` command
+  commands/cmd_init.py              # installs litellm, copies guardrail module
+  config.py                         # GuardrailConfig + CiscoAIDefenseConfig dataclasses
+
+internal/config/
+  config.go                         # GuardrailConfig + CiscoAIDefenseConfig Go structs
+
+internal/policy/
+  types.go                          # GuardrailInput / GuardrailOutput types
+  engine.go                         # EvaluateGuardrail method
+
+internal/gateway/
+  litellm.go                        # LiteLLMProcess — child process + env injection
+  api.go                            # POST /v1/guardrail/evaluate endpoint
+  sidecar.go                        # runGuardrail() goroutine
+  health.go                         # guardrail subsystem health tracking
+
+~/.defenseclaw/                     # runtime (generated, not in repo)
+  config.yaml                       # guardrail section (incl. scanner_mode, cisco_ai_defense)
+  litellm_config.yaml               # generated by setup guardrail
+  defenseclaw_guardrail.py          # copied from repo
+```
+
+## Per-Inspection Audit Events
+
+Every guardrail verdict is written to the SQLite audit store via two
+event types:
+
+| Action | Trigger | Severity |
+|--------|---------|----------|
+| `guardrail-inspection` | Python guardrail POSTs to `/v1/guardrail/event` | From verdict |
+| `guardrail-opa-inspection` | OPA evaluation via `/v1/guardrail/evaluate` | From OPA output |
+
+These events are queryable via `defenseclaw audit list` and forwarded to
+Splunk when the SIEM adapter is enabled.
+
+## Streaming Response Inspection
+
+The guardrail implements `async_post_call_streaming_iterator_hook` for
+token-by-token inspection of streaming LLM responses:
+
+- Accumulates text as chunks arrive
+- Every 500 characters, runs a quick local pattern scan
+- In `action` mode, terminates the stream immediately if a threat is detected
+- After the stream completes, runs the full multi-scanner inspection pipeline
+
+## Hot Reload
+
+Mode and scanner_mode can be changed at runtime without restarting:
+
+```bash
+# Switch from observe to action mode
+curl -X PATCH http://127.0.0.1:18790/v1/guardrail/config \
+  -H 'Content-Type: application/json' \
+  -H 'X-DefenseClaw-Client: cli' \
+  -d '{"mode": "action", "scanner_mode": "both"}'
+
+# Check current config
+curl http://127.0.0.1:18790/v1/guardrail/config
+```
+
+The PATCH endpoint updates the in-memory config and writes
+`guardrail_runtime.json`. The Python guardrail reads this file with a
+5-second TTL cache, lazily creating or destroying the Cisco client as
+`scanner_mode` changes.
+
+## Setup Wizard
+
+`defenseclaw setup guardrail` now prompts for:
+
+1. Enable guardrail? (yes/no)
+2. Mode (observe/action)
+3. Scanner mode (local/remote/both)
+4. Cisco AI Defense endpoint, API key env var, timeout (if remote/both)
+5. LiteLLM proxy port
+6. Upstream model detection + routing
+
+Non-interactive mode supports all options as flags:
+
+```bash
+defenseclaw setup guardrail \
+  --mode action \
+  --scanner-mode both \
+  --cisco-endpoint https://us.api.inspect.aidefense.security.cisco.com \
+  --cisco-api-key-env CISCO_AI_DEFENSE_API_KEY \
+  --cisco-timeout-ms 3000 \
+  --port 4000 \
+  --non-interactive
+```
 
 ## Future Extensions
 
-- **Cisco AI Defense integration**: Replace or augment local pattern matching
-  with ML-based detection via Cisco's cloud API. Would require an async
-  call from the guardrail module (or a sidecar REST endpoint that proxies
-  to the Cisco API).
-- **Per-inspection audit events**: Write each inspection verdict to the
-  SQLite audit store for forensic analysis and SIEM forwarding.
-- **Streaming inspection**: Implement `async_post_call_streaming_iterator_hook`
-  to inspect streaming responses token-by-token.
-- **Custom pattern sets**: Load detection patterns from a YAML policy file
-  instead of hardcoded lists.
-- **Hot mode reload**: Allow switching between observe/action without
-  restarting the sidecar (would require re-adding the mode config endpoint
-  and having the guardrail poll periodically).
+- **Hot pattern reload**: Load pattern updates from `data.json` without
+  restarting the guardrail process.
+- **Approval queue**: Require human approval for blocked prompts in
+  high-security environments.

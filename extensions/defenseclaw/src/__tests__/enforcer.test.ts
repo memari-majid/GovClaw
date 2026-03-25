@@ -399,6 +399,23 @@ describe("PolicyEnforcer", () => {
       expect(eventBody.action).toBe("admission");
       expect(eventBody.actor).toBe("defenseclaw-plugin");
     });
+
+    it("uses audit-store severity vocabulary in admission events", async () => {
+      const enforcer = makeEnforcer();
+
+      await enforcer.block("plugin", "sev-blocked", "test block");
+      await enforcer.evaluatePlugin(tempDir, "sev-blocked");
+
+      const auditPosts = requests.filter(
+        (r) => r.url === "/audit/event" && r.method === "POST",
+      );
+      const blockedEvent = auditPosts.find((r) => {
+        const body = JSON.parse(r.body);
+        return body.action === "admission" && body.details?.includes('"blocked"');
+      });
+      expect(blockedEvent).toBeDefined();
+      expect(JSON.parse(blockedEvent!.body).severity).toBe("HIGH");
+    });
   });
 
   describe("evaluateMCPServer - admission gate", () => {

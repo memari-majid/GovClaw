@@ -331,6 +331,11 @@ def _fetch_ssm_token(param: str, region: str, profile: str | None) -> str | None
 @click.option("--disable", is_flag=True, help="Disable guardrail and revert OpenClaw config")
 @click.option("--mode", "guard_mode", type=click.Choice(["observe", "action"]), default=None,
               help="Guardrail mode")
+@click.option("--scanner-mode", type=click.Choice(["local", "remote", "both"]), default=None,
+              help="Scanner mode (local patterns, remote Cisco API, or both)")
+@click.option("--cisco-endpoint", default=None, help="Cisco AI Defense API endpoint")
+@click.option("--cisco-api-key-env", default=None, help="Env var name holding Cisco AI Defense API key")
+@click.option("--cisco-timeout-ms", type=int, default=None, help="Cisco AI Defense timeout (ms)")
 @click.option("--port", "guard_port", type=int, default=None, help="LiteLLM proxy port")
 @click.option("--restart", is_flag=True, help="Restart defenseclaw-gateway and openclaw gateway after setup")
 @click.option("--non-interactive", is_flag=True, help="Use flags instead of prompts")
@@ -339,6 +344,7 @@ def setup_guardrail(
     app: AppContext,
     disable: bool,
     guard_mode, guard_port,
+    scanner_mode, cisco_endpoint, cisco_api_key_env, cisco_timeout_ms,
     restart: bool,
     non_interactive: bool,
 ) -> None:
@@ -370,6 +376,14 @@ def setup_guardrail(
     if non_interactive:
         if guard_mode is not None:
             gc.mode = guard_mode
+        if scanner_mode is not None:
+            gc.scanner_mode = scanner_mode
+        if cisco_endpoint is not None:
+            gc.cisco_ai_defense.endpoint = cisco_endpoint
+        if cisco_api_key_env is not None:
+            gc.cisco_ai_defense.api_key_env = cisco_api_key_env
+        if cisco_timeout_ms is not None:
+            gc.cisco_ai_defense.timeout_ms = cisco_timeout_ms
         if guard_port is not None:
             gc.port = guard_port
         gc.enabled = True
@@ -421,7 +435,7 @@ def setup_guardrail(
     if app.logger:
         app.logger.log_action(
             "setup-guardrail", "config",
-            f"mode={gc.mode} port={gc.port} model={gc.model}",
+            f"mode={gc.mode} scanner_mode={gc.scanner_mode} port={gc.port} model={gc.model}",
         )
 
 
@@ -453,6 +467,37 @@ def _interactive_guardrail_setup(app: AppContext, gc) -> None:
     gc.mode = click.prompt(
         "  Mode", type=click.Choice(["observe", "action"]), default=gc.mode or "observe",
     )
+
+    click.echo()
+    click.echo("  Scanner modes:")
+    click.echo("    local  — pattern matching only, no network calls (fastest)")
+    click.echo("    remote — Cisco AI Defense cloud API only")
+    click.echo("    both   — local first, then Cisco if clean (recommended)")
+    gc.scanner_mode = click.prompt(
+        "  Scanner mode", type=click.Choice(["local", "remote", "both"]),
+        default=gc.scanner_mode or "local",
+    )
+
+    if gc.scanner_mode in ("remote", "both"):
+        click.echo()
+        click.echo("  Cisco AI Defense Configuration")
+        click.echo("  ──────────────────────────────")
+        gc.cisco_ai_defense.endpoint = click.prompt(
+            "  API endpoint", default=gc.cisco_ai_defense.endpoint,
+        )
+        cisco_key_env = gc.cisco_ai_defense.api_key_env or "CISCO_AI_DEFENSE_API_KEY"
+        env_val = os.environ.get(cisco_key_env, "")
+        if env_val:
+            click.echo(f"  API key env var: {cisco_key_env} ({_mask(env_val)})")
+        else:
+            click.echo(f"  API key env var: {cisco_key_env} (not set)")
+            click.echo(f"    Set it before starting: export {cisco_key_env}=your-key")
+        gc.cisco_ai_defense.api_key_env = click.prompt(
+            "  API key env var name", default=cisco_key_env,
+        )
+        gc.cisco_ai_defense.timeout_ms = click.prompt(
+            "  Timeout (ms)", default=gc.cisco_ai_defense.timeout_ms, type=int,
+        )
 
     gc.port = click.prompt("  LiteLLM proxy port", default=gc.port or 4000, type=int)
 
@@ -575,11 +620,16 @@ def _print_guardrail_summary(gc, openclaw_config_file: str, *, restart: bool = F
 
     rows = [
         ("mode", gc.mode),
+        ("scanner_mode", gc.scanner_mode),
         ("port", str(gc.port)),
         ("model", gc.model),
         ("model_name", gc.model_name),
         ("api_key_env", gc.api_key_env),
     ]
+    if gc.scanner_mode in ("remote", "both"):
+        rows.append(("cisco_endpoint", gc.cisco_ai_defense.endpoint))
+        rows.append(("cisco_api_key_env", gc.cisco_ai_defense.api_key_env))
+        rows.append(("cisco_timeout_ms", str(gc.cisco_ai_defense.timeout_ms)))
     for key, val in rows:
         click.echo(f"    guardrail.{key + ':':<16s} {val}")
     click.echo()

@@ -78,6 +78,8 @@ func (a *APIServer) Run(ctx context.Context) error {
 	mux.HandleFunc("/v1/skill/scan", a.handleSkillScan)
 	mux.HandleFunc("/v1/skill/fetch", a.handleSkillFetch)
 	mux.HandleFunc("/v1/guardrail/event", a.handleGuardrailEvent)
+	mux.HandleFunc("/v1/guardrail/evaluate", a.handleGuardrailEvaluate)
+	mux.HandleFunc("/v1/guardrail/config", a.handleGuardrailConfig)
 
 	srv := &http.Server{
 		Addr:    a.addr,
@@ -172,7 +174,9 @@ func (a *APIServer) handleSkillDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-skill-disable", req.SkillKey, "disabled via REST API")
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-skill-disable", req.SkillKey, "disabled via REST API")
+	}
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "disabled", "skillKey": req.SkillKey})
 }
 
@@ -205,7 +209,9 @@ func (a *APIServer) handleSkillEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-skill-enable", req.SkillKey, "enabled via REST API")
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-skill-enable", req.SkillKey, "enabled via REST API")
+	}
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "enabled", "skillKey": req.SkillKey})
 }
 
@@ -274,7 +280,9 @@ func (a *APIServer) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-config-patch", req.Path, fmt.Sprintf("patched via REST API value_type=%T", req.Value))
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-config-patch", req.Path, fmt.Sprintf("patched via REST API value_type=%T", req.Value))
+	}
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "patched", "path": req.Path})
 }
 
@@ -666,8 +674,10 @@ func (a *APIServer) handleSkillScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-skill-scan", req.Target, fmt.Sprintf("findings=%d max=%s", len(result.Findings), result.MaxSeverity()))
-	_ = a.logger.LogScanWithVerdict(result, "")
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-skill-scan", req.Target, fmt.Sprintf("findings=%d max=%s", len(result.Findings), result.MaxSeverity()))
+		_ = a.logger.LogScanWithVerdict(result, "")
+	}
 
 	a.writeJSON(w, http.StatusOK, result)
 }
@@ -704,7 +714,9 @@ func (a *APIServer) handleSkillFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-skill-fetch", req.Target, "streaming skill tar.gz")
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-skill-fetch", req.Target, "streaming skill tar.gz")
+	}
 
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(req.Target)+".tar.gz"))
@@ -797,7 +809,19 @@ func (a *APIServer) handleGuardrailEvent(w http.ResponseWriter, r *http.Request)
 	if req.Reason != "" {
 		details += fmt.Sprintf(" reason=%s", truncate(req.Reason, 120))
 	}
-	_ = a.logger.LogAction("guardrail-verdict", req.Model, details)
+	if a.logger != nil {
+		_ = a.logger.LogAction("guardrail-verdict", req.Model, details)
+	}
+	if a.store != nil {
+		evt := audit.Event{
+			Action:    "guardrail-inspection",
+			Target:    req.Model,
+			Severity:  req.Severity,
+			Details:   details,
+			Timestamp: time.Now().UTC(),
+		}
+		_ = a.store.LogEvent(evt)
+	}
 
 	if a.otel != nil {
 		ctx := r.Context()
@@ -816,6 +840,191 @@ func (a *APIServer) handleGuardrailEvent(w http.ResponseWriter, r *http.Request)
 	}
 
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type guardrailEvaluateRequest struct {
+	Direction     string                      `json:"direction"`
+	Model         string                      `json:"model"`
+	Mode          string                      `json:"mode"`
+	ScannerMode   string                      `json:"scanner_mode"`
+	LocalResult   *policy.GuardrailScanResult `json:"local_result"`
+	CiscoResult   *policy.GuardrailScanResult `json:"cisco_result"`
+	ContentLength int                         `json:"content_length"`
+	ElapsedMs     float64                     `json:"elapsed_ms"`
+}
+
+func (a *APIServer) handleGuardrailEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req guardrailEvaluateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Direction == "" || req.Mode == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "direction and mode are required"})
+		return
+	}
+
+	input := policy.GuardrailInput{
+		Direction:     req.Direction,
+		Model:         req.Model,
+		Mode:          req.Mode,
+		ScannerMode:   req.ScannerMode,
+		LocalResult:   req.LocalResult,
+		CiscoResult:   req.CiscoResult,
+		ContentLength: req.ContentLength,
+	}
+
+	out, err := a.evaluateGuardrailPolicy(r.Context(), input)
+	if err != nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+
+	details := fmt.Sprintf("direction=%s action=%s severity=%s scanner_mode=%s sources=%v elapsed_ms=%.1f",
+		req.Direction, out.Action, out.Severity, req.ScannerMode, out.ScannerSources, req.ElapsedMs)
+	if out.Reason != "" {
+		details += fmt.Sprintf(" reason=%s", truncate(out.Reason, 120))
+	}
+	if a.logger != nil {
+		_ = a.logger.LogAction("guardrail-opa-verdict", req.Model, details)
+	}
+	if a.store != nil {
+		evt := audit.Event{
+			Action:    "guardrail-opa-inspection",
+			Target:    req.Model,
+			Severity:  out.Severity,
+			Details:   details,
+			Timestamp: time.Now().UTC(),
+		}
+		_ = a.store.LogEvent(evt)
+	}
+
+	if a.otel != nil {
+		ctx := r.Context()
+		for _, src := range out.ScannerSources {
+			a.otel.RecordGuardrailEvaluation(ctx, src, out.Action)
+		}
+		a.otel.RecordGuardrailLatency(ctx, "opa-guardrail", req.ElapsedMs)
+	}
+
+	a.writeJSON(w, http.StatusOK, out)
+}
+
+func (a *APIServer) handleGuardrailConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cfg := map[string]interface{}{
+			"mode":         "observe",
+			"scanner_mode": "local",
+		}
+		if a.scannerCfg != nil {
+			cfg["mode"] = a.scannerCfg.Guardrail.Mode
+			cfg["scanner_mode"] = a.scannerCfg.Guardrail.ScannerMode
+		}
+		a.writeJSON(w, http.StatusOK, cfg)
+
+	case http.MethodPatch:
+		var req map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+
+		if a.scannerCfg == nil {
+			a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config not available"})
+			return
+		}
+
+		changed := []string{}
+		if mode, ok := req["mode"]; ok && (mode == "observe" || mode == "action") {
+			a.scannerCfg.Guardrail.Mode = mode
+			changed = append(changed, "mode="+mode)
+		}
+		if sm, ok := req["scanner_mode"]; ok && (sm == "local" || sm == "remote" || sm == "both") {
+			a.scannerCfg.Guardrail.ScannerMode = sm
+			changed = append(changed, "scanner_mode="+sm)
+		}
+
+		if len(changed) == 0 {
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid fields to update"})
+			return
+		}
+
+		if err := a.writeGuardrailRuntime(); err != nil {
+			a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+
+		if a.logger != nil {
+			_ = a.logger.LogAction("guardrail-config-reload", "", strings.Join(changed, " "))
+		}
+
+		a.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":       "updated",
+			"changed":      changed,
+			"mode":         a.scannerCfg.Guardrail.Mode,
+			"scanner_mode": a.scannerCfg.Guardrail.ScannerMode,
+		})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *APIServer) writeGuardrailRuntime() error {
+	if a.scannerCfg == nil {
+		return fmt.Errorf("api: no config available")
+	}
+	runtimeFile := filepath.Join(a.scannerCfg.DataDir, "guardrail_runtime.json")
+	data, err := json.Marshal(map[string]string{
+		"mode":         a.scannerCfg.Guardrail.Mode,
+		"scanner_mode": a.scannerCfg.Guardrail.ScannerMode,
+	})
+	if err != nil {
+		return fmt.Errorf("api: marshal runtime config: %w", err)
+	}
+	return os.WriteFile(runtimeFile, data, 0o600)
+}
+
+func (a *APIServer) evaluateGuardrailPolicy(ctx context.Context, input policy.GuardrailInput) (*policy.GuardrailOutput, error) {
+	if a.scannerCfg != nil && a.scannerCfg.PolicyDir != "" {
+		engine, err := policy.New(a.scannerCfg.PolicyDir)
+		if err == nil {
+			out, evalErr := engine.EvaluateGuardrail(ctx, input)
+			if evalErr == nil {
+				return out, nil
+			}
+		}
+	}
+
+	sev := "NONE"
+	action := "allow"
+	var sources []string
+	for _, res := range []*policy.GuardrailScanResult{input.LocalResult, input.CiscoResult} {
+		if res == nil {
+			continue
+		}
+		rank := map[string]int{"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+		if rank[res.Severity] > rank[sev] {
+			sev = res.Severity
+			action = res.Action
+		}
+		if res.Severity != "NONE" {
+			sources = append(sources, "scanner")
+		}
+	}
+
+	return &policy.GuardrailOutput{
+		Action:         action,
+		Severity:       sev,
+		Reason:         "built-in fallback (OPA unavailable)",
+		ScannerSources: sources,
+	}, nil
 }
 
 // csrfProtect wraps a handler with localhost CSRF defenses. Mutating methods
