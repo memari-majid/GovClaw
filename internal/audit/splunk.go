@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -39,6 +40,7 @@ func DefaultSplunkConfig() SplunkConfig {
 type SplunkForwarder struct {
 	cfg    SplunkConfig
 	client *http.Client
+	mu     sync.Mutex
 	batch  []splunkEvent
 }
 
@@ -103,28 +105,44 @@ func (f *SplunkForwarder) ForwardEvent(e Event) error {
 		},
 	}
 
+	f.mu.Lock()
 	f.batch = append(f.batch, se)
-	if len(f.batch) >= f.cfg.BatchSize {
+	needsFlush := len(f.batch) >= f.cfg.BatchSize
+	f.mu.Unlock()
+
+	if needsFlush {
 		return f.Flush()
 	}
 	return nil
 }
 
 func (f *SplunkForwarder) Flush() error {
+	f.mu.Lock()
 	if len(f.batch) == 0 {
+		f.mu.Unlock()
 		return nil
 	}
 
+	pending := make([]splunkEvent, len(f.batch))
+	copy(pending, f.batch)
+	f.batch = f.batch[:0]
+	f.mu.Unlock()
+
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	for _, e := range f.batch {
+	for _, e := range pending {
 		if err := enc.Encode(e); err != nil {
 			return fmt.Errorf("splunk: encode event: %w", err)
 		}
 	}
-	f.batch = f.batch[:0]
 
-	return f.sendHEC(buf.Bytes())
+	if err := f.sendHEC(buf.Bytes()); err != nil {
+		f.mu.Lock()
+		f.batch = append(pending, f.batch...)
+		f.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (f *SplunkForwarder) sendHEC(payload []byte) error {

@@ -302,8 +302,6 @@ func (w *InstallWatcher) runAdmission(ctx context.Context, evt InstallEvent) Adm
 		return AdmissionResult{Event: evt, Verdict: VerdictScanError, Reason: err.Error()}
 	}
 
-	_ = w.logger.LogScan(result)
-
 	// Phase 3: post-scan OPA evaluation with scan_result.
 	if w.opa != nil {
 		scanInput := &policy.ScanResultInput{
@@ -321,6 +319,7 @@ func (w *InstallWatcher) runAdmission(ctx context.Context, evt InstallEvent) Adm
 		out, evalErr := w.opa.Evaluate(ctx, input)
 		if evalErr == nil {
 			w.applyPostScanEnforcement(pe, out, evt, targetType, result, s.Name())
+			_ = w.logger.LogScanWithVerdict(result, out.Verdict)
 			return AdmissionResult{Event: evt, Verdict: toVerdict(out.Verdict), Reason: out.Reason}
 		}
 		// On OPA error, fall through to built-in logic.
@@ -330,6 +329,7 @@ func (w *InstallWatcher) runAdmission(ctx context.Context, evt InstallEvent) Adm
 	if result.IsClean() {
 		_ = w.logger.LogAction("install-clean", evt.Path,
 			fmt.Sprintf("type=%s scanner=%s", targetType, s.Name()))
+		_ = w.logger.LogScanWithVerdict(result, string(VerdictClean))
 		return AdmissionResult{Event: evt, Verdict: VerdictClean, Reason: "scan clean"}
 	}
 
@@ -345,21 +345,31 @@ func (w *InstallWatcher) runAdmission(ctx context.Context, evt InstallEvent) Adm
 			pe.SetSourcePath(targetType, evt.Name, evt.Path)
 
 			action := w.cfg.SkillActions.ForSeverity(string(maxSev))
+			enforcement := map[string]string{
+				"source_path": evt.Path,
+				"install":     "block",
+			}
 			if action.File == config.FileActionQuarantine {
 				_ = pe.Quarantine(targetType, evt.Name, blockReason)
+				enforcement["file"] = "quarantine"
 			}
 			if action.Runtime == config.RuntimeDisable {
 				_ = pe.Disable(targetType, evt.Name, blockReason)
+				enforcement["runtime"] = "disable"
 			}
+			_ = w.logger.LogActionWithEnforcement("watcher-block", evt.Name,
+				fmt.Sprintf("type=%s reason=%s", targetType, blockReason), enforcement)
 
 			w.enforceBlock(evt)
 		}
+		_ = w.logger.LogScanWithVerdict(result, string(VerdictRejected))
 		return AdmissionResult{Event: evt, Verdict: VerdictRejected, Reason: reason}
 	}
 
 	reason := fmt.Sprintf("scan found %s findings — installed with warning", maxSev)
 	_ = w.logger.LogAction("install-warning", evt.Path,
 		fmt.Sprintf("type=%s severity=%s scanner=%s", targetType, maxSev, s.Name()))
+	_ = w.logger.LogScanWithVerdict(result, string(VerdictWarning))
 	return AdmissionResult{Event: evt, Verdict: VerdictWarning, Reason: reason}
 }
 
@@ -380,10 +390,18 @@ func (w *InstallWatcher) applyPostScanEnforcement(pe *enforce.PolicyEngine, out 
 			_ = pe.Block(targetType, evt.Name, blockReason)
 			pe.SetSourcePath(targetType, evt.Name, evt.Path)
 
+			enforcement := map[string]string{
+				"source_path": evt.Path,
+				"install":     "block",
+				"runtime":     "disable",
+			}
 			if out.FileAction == "quarantine" {
 				_ = pe.Quarantine(targetType, evt.Name, blockReason)
+				enforcement["file"] = "quarantine"
 			}
 			_ = pe.Disable(targetType, evt.Name, blockReason)
+			_ = w.logger.LogActionWithEnforcement("watcher-block", evt.Name,
+				fmt.Sprintf("type=%s reason=%s", targetType, blockReason), enforcement)
 			w.enforceBlock(evt)
 		}
 	case "warning":

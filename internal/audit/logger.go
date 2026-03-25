@@ -9,11 +9,13 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/defenseclaw/defenseclaw/internal/scanner"
+	"github.com/defenseclaw/defenseclaw/internal/telemetry"
 )
 
 type Logger struct {
-	store    *Store
-	splunk   *SplunkForwarder
+	store  *Store
+	splunk *SplunkForwarder
+	otel   *telemetry.Provider
 }
 
 func NewLogger(store *Store) *Logger {
@@ -24,7 +26,18 @@ func (l *Logger) SetSplunkForwarder(sf *SplunkForwarder) {
 	l.splunk = sf
 }
 
+func (l *Logger) SetOTelProvider(p *telemetry.Provider) {
+	l.otel = p
+}
+
+// LogScan persists a scan result to SQLite, forwards to Splunk HEC,
+// and emits OTel log/metric signals.
 func (l *Logger) LogScan(result *scanner.ScanResult) error {
+	return l.LogScanWithVerdict(result, "")
+}
+
+// LogScanWithVerdict persists a scan result with an explicit admission verdict.
+func (l *Logger) LogScanWithVerdict(result *scanner.ScanResult, verdict string) error {
 	scanID := uuid.New().String()
 	raw, _ := result.JSON()
 
@@ -61,10 +74,24 @@ func (l *Logger) LogScan(result *scanner.ScanResult) error {
 		return err
 	}
 	l.forwardToSplunk(event)
+
+	if l.otel != nil {
+		targetType := inferTargetType(result.Scanner)
+		l.otel.EmitScanResult(result, scanID, targetType, verdict)
+	}
+
 	return nil
 }
 
+// LogAction persists an action event and emits OTel lifecycle signals.
 func (l *Logger) LogAction(action, target, details string) error {
+	return l.LogActionWithEnforcement(action, target, details, nil)
+}
+
+// LogActionWithEnforcement persists an action event with enforcement metadata
+// for OTel lifecycle signals. The enforcement map may contain keys:
+// "install", "file", "runtime", "source_path".
+func (l *Logger) LogActionWithEnforcement(action, target, details string, enforcement map[string]string) error {
 	event := Event{
 		Timestamp: time.Now().UTC(),
 		Action:    action,
@@ -76,6 +103,12 @@ func (l *Logger) LogAction(action, target, details string) error {
 		return err
 	}
 	l.forwardToSplunk(event)
+
+	if l.otel != nil {
+		assetType := inferAssetTypeFromAction(action, details)
+		l.otel.EmitLifecycleEvent(action, target, assetType, details, event.Severity, enforcement)
+	}
+
 	return nil
 }
 
@@ -94,4 +127,44 @@ func (l *Logger) Close() {
 			fmt.Fprintf(os.Stderr, "warning: splunk flush on close: %v\n", err)
 		}
 	}
+}
+
+func inferTargetType(scannerName string) string {
+	switch scannerName {
+	case "mcp-scanner", "mcp_scanner":
+		return "mcp"
+	case "skill-scanner", "skill_scanner":
+		return "skill"
+	case "codeguard", "aibom",
+		"clawshield-vuln", "clawshield-secrets", "clawshield-pii",
+		"clawshield-malware", "clawshield-injection":
+		return "code"
+	default:
+		return "unknown"
+	}
+}
+
+func inferAssetTypeFromAction(action, details string) string {
+	switch {
+	case contains(action, "mcp") || contains(details, "type=mcp"):
+		return "mcp"
+	case contains(action, "skill") || contains(details, "type=skill"):
+		return "skill"
+	default:
+		return "skill"
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		findSubstring(s, substr))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

@@ -11,23 +11,34 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/defenseclaw/defenseclaw/internal/audit"
 	"github.com/defenseclaw/defenseclaw/internal/config"
+	"github.com/defenseclaw/defenseclaw/internal/enforce"
+	"github.com/defenseclaw/defenseclaw/internal/policy"
 	"github.com/defenseclaw/defenseclaw/internal/scanner"
+	"github.com/defenseclaw/defenseclaw/internal/telemetry"
 )
 
 // APIServer exposes a local REST API for CLI and plugin communication
 // with the running sidecar.
 type APIServer struct {
-	health      *SidecarHealth
-	client      *Client
-	store       *audit.Store
-	logger      *audit.Logger
-	addr        string
-	scannerCfg  *config.Config
+	health     *SidecarHealth
+	client     *Client
+	store      *audit.Store
+	logger     *audit.Logger
+	addr       string
+	scannerCfg *config.Config
+	otel       *telemetry.Provider
+}
+
+// SetOTelProvider attaches the OTel provider so guardrail events
+// can be recorded as metrics.
+func (a *APIServer) SetOTelProvider(p *telemetry.Provider) {
+	a.otel = p
 }
 
 // NewAPIServer creates the REST API server bound to the given address.
@@ -53,14 +64,24 @@ func (a *APIServer) Run(ctx context.Context) error {
 	mux.HandleFunc("/skill/disable", a.handleSkillDisable)
 	mux.HandleFunc("/skill/enable", a.handleSkillEnable)
 	mux.HandleFunc("/config/patch", a.handleConfigPatch)
+	mux.HandleFunc("/scan/result", a.handleScanResult)
+	mux.HandleFunc("/enforce/block", a.handleEnforceBlock)
+	mux.HandleFunc("/enforce/allow", a.handleEnforceAllow)
+	mux.HandleFunc("/enforce/blocked", a.handleEnforceBlocked)
+	mux.HandleFunc("/enforce/allowed", a.handleEnforceAllowed)
+	mux.HandleFunc("/alerts", a.handleAlerts)
+	mux.HandleFunc("/audit/event", a.handleAuditEvent)
+	mux.HandleFunc("/policy/evaluate", a.handlePolicyEvaluate)
 	mux.HandleFunc("/skills", a.handleSkills)
+	mux.HandleFunc("/mcps", a.handleMCPs)
 	mux.HandleFunc("/tools/catalog", a.handleToolsCatalog)
 	mux.HandleFunc("/v1/skill/scan", a.handleSkillScan)
 	mux.HandleFunc("/v1/skill/fetch", a.handleSkillFetch)
+	mux.HandleFunc("/v1/guardrail/event", a.handleGuardrailEvent)
 
 	srv := &http.Server{
 		Addr:    a.addr,
-		Handler: mux,
+		Handler: csrfProtect(mux),
 		BaseContext: func(_ net.Listener) context.Context {
 			return ctx
 		},
@@ -193,6 +214,37 @@ type configPatchRequest struct {
 	Value interface{} `json:"value"`
 }
 
+type enforcementRequest struct {
+	TargetType string `json:"target_type"`
+	TargetName string `json:"target_name"`
+	Reason     string `json:"reason"`
+}
+
+type enforcementEntry struct {
+	ID         string    `json:"id"`
+	TargetType string    `json:"target_type"`
+	TargetName string    `json:"target_name"`
+	Reason     string    `json:"reason"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type policyEvaluateRequest struct {
+	Domain string              `json:"domain"`
+	Input  policyEvaluateInput `json:"input"`
+}
+
+type policyEvaluateInput struct {
+	TargetType string                    `json:"target_type"`
+	TargetName string                    `json:"target_name"`
+	Path       string                    `json:"path"`
+	ScanResult *policyEvaluateScanResult `json:"scan_result,omitempty"`
+}
+
+type policyEvaluateScanResult struct {
+	MaxSeverity   string `json:"max_severity"`
+	TotalFindings int    `json:"total_findings"`
+}
+
 func (a *APIServer) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -222,8 +274,265 @@ func (a *APIServer) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.logger.LogAction("api-config-patch", req.Path, fmt.Sprintf("patched via REST API value=%v", req.Value))
+	_ = a.logger.LogAction("api-config-patch", req.Path, fmt.Sprintf("patched via REST API value_type=%T", req.Value))
 	a.writeJSON(w, http.StatusOK, map[string]string{"status": "patched", "path": req.Path})
+}
+
+func (a *APIServer) handleScanResult(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	logger := a.logger
+	if logger == nil {
+		if a.store == nil {
+			a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+			return
+		}
+		logger = audit.NewLogger(a.store)
+	}
+
+	var result scanner.ScanResult
+	if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if result.Scanner == "" || result.Target == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "scanner and target are required"})
+		return
+	}
+	if result.Timestamp.IsZero() {
+		result.Timestamp = time.Now().UTC()
+	}
+
+	if err := logger.LogScan(&result); err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *APIServer) handleEnforceBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	var req enforcementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.TargetType == "" || req.TargetName == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_type and target_name are required"})
+		return
+	}
+
+	pe := enforce.NewPolicyEngine(a.store)
+	switch r.Method {
+	case http.MethodPost:
+		reason := req.Reason
+		if reason == "" {
+			reason = "blocked via REST API"
+		}
+		if err := pe.Block(req.TargetType, req.TargetName, reason); err != nil {
+			a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if a.logger != nil {
+			_ = a.logger.LogAction("api-enforce-block", req.TargetName, fmt.Sprintf("type=%s reason=%s", req.TargetType, truncate(reason, 120)))
+		}
+		a.writeJSON(w, http.StatusOK, map[string]string{"status": "blocked"})
+	case http.MethodDelete:
+		if err := pe.Unblock(req.TargetType, req.TargetName); err != nil {
+			a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if a.logger != nil {
+			_ = a.logger.LogAction("api-enforce-unblock", req.TargetName, fmt.Sprintf("type=%s", req.TargetType))
+		}
+		a.writeJSON(w, http.StatusOK, map[string]string{"status": "unblocked"})
+	}
+}
+
+func (a *APIServer) handleEnforceAllow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	var req enforcementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.TargetType == "" || req.TargetName == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_type and target_name are required"})
+		return
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "allowed via REST API"
+	}
+
+	pe := enforce.NewPolicyEngine(a.store)
+	if err := pe.Allow(req.TargetType, req.TargetName, reason); err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-enforce-allow", req.TargetName, fmt.Sprintf("type=%s reason=%s", req.TargetType, truncate(reason, 120)))
+	}
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "allowed"})
+}
+
+func (a *APIServer) handleEnforceBlocked(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	entries, err := enforce.NewPolicyEngine(a.store).ListBlocked()
+	if err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, toEnforcementEntries(entries))
+}
+
+func (a *APIServer) handleEnforceAllowed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	entries, err := enforce.NewPolicyEngine(a.store).ListAllowed()
+	if err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, toEnforcementEntries(entries))
+}
+
+func (a *APIServer) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be a positive integer"})
+			return
+		}
+		limit = parsed
+	}
+
+	alerts, err := a.store.ListAlerts(limit)
+	if err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, alerts)
+}
+
+func (a *APIServer) handleAuditEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	var event audit.Event
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if event.Action == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "action is required"})
+		return
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+	if event.Severity == "" {
+		event.Severity = "INFO"
+	}
+	if err := a.store.LogEvent(event); err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *APIServer) handlePolicyEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req policyEvaluateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Domain != "" && req.Domain != "admission" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported policy domain"})
+		return
+	}
+	if req.Input.TargetType == "" || req.Input.TargetName == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "input.target_type and input.target_name are required"})
+		return
+	}
+
+	input := policy.AdmissionInput{
+		TargetType: req.Input.TargetType,
+		TargetName: req.Input.TargetName,
+		Path:       req.Input.Path,
+		BlockList:  a.blockListEntries(),
+		AllowList:  a.allowListEntries(),
+	}
+	if req.Input.ScanResult != nil {
+		input.ScanResult = &policy.ScanResultInput{
+			MaxSeverity:   req.Input.ScanResult.MaxSeverity,
+			TotalFindings: req.Input.ScanResult.TotalFindings,
+		}
+	}
+
+	out, err := a.evaluateAdmissionPolicy(r.Context(), input)
+	if err != nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "data": out})
 }
 
 func (a *APIServer) handleSkills(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +558,37 @@ func (a *APIServer) handleSkills(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+func (a *APIServer) handleMCPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.scannerCfg == nil {
+		a.writeJSON(w, http.StatusOK, []string{})
+		return
+	}
+
+	seen := make(map[string]bool)
+	var names []string
+	for _, dir := range a.scannerCfg.MCPDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+
+	a.writeJSON(w, http.StatusOK, names)
 }
 
 func (a *APIServer) handleToolsCatalog(w http.ResponseWriter, r *http.Request) {
@@ -327,6 +667,7 @@ func (a *APIServer) handleSkillScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = a.logger.LogAction("api-skill-scan", req.Target, fmt.Sprintf("findings=%d max=%s", len(result.Findings), result.MaxSeverity()))
+	_ = a.logger.LogScanWithVerdict(result, "")
 
 	a.writeJSON(w, http.StatusOK, result)
 }
@@ -419,8 +760,214 @@ func (a *APIServer) handleSkillFetch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// POST /v1/guardrail/event — receive verdict telemetry from the Python guardrail
+// ---------------------------------------------------------------------------
+
+type guardrailEventRequest struct {
+	Direction string   `json:"direction"`
+	Model     string   `json:"model"`
+	Action    string   `json:"action"`
+	Severity  string   `json:"severity"`
+	Reason    string   `json:"reason"`
+	Findings  []string `json:"findings"`
+	ElapsedMs float64  `json:"elapsed_ms"`
+	TokensIn  *int64   `json:"tokens_in,omitempty"`
+	TokensOut *int64   `json:"tokens_out,omitempty"`
+}
+
+func (a *APIServer) handleGuardrailEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req guardrailEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Direction == "" || req.Action == "" || req.Severity == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "direction, action, and severity are required"})
+		return
+	}
+
+	details := fmt.Sprintf("direction=%s action=%s severity=%s findings=%d elapsed_ms=%.1f",
+		req.Direction, req.Action, req.Severity, len(req.Findings), req.ElapsedMs)
+	if req.Reason != "" {
+		details += fmt.Sprintf(" reason=%s", truncate(req.Reason, 120))
+	}
+	_ = a.logger.LogAction("guardrail-verdict", req.Model, details)
+
+	if a.otel != nil {
+		ctx := r.Context()
+		a.otel.RecordGuardrailEvaluation(ctx, "litellm-guardrail", req.Action)
+		a.otel.RecordGuardrailLatency(ctx, "litellm-guardrail", req.ElapsedMs)
+		if req.TokensIn != nil || req.TokensOut != nil {
+			var tIn, tOut int64
+			if req.TokensIn != nil {
+				tIn = *req.TokensIn
+			}
+			if req.TokensOut != nil {
+				tOut = *req.TokensOut
+			}
+			a.otel.RecordLLMTokens(ctx, "litellm", tIn, tOut)
+		}
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// csrfProtect wraps a handler with localhost CSRF defenses. Mutating methods
+// (POST, PUT, PATCH, DELETE) require:
+//  1. X-DefenseClaw-Client header (blocks simple/no-cors browser requests)
+//  2. Content-Type containing "application/json"
+//  3. Origin, if present, must be a localhost address
+//
+// Read-only requests (GET, HEAD, OPTIONS) are exempt.
+func csrfProtect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if r.Header.Get("X-DefenseClaw-Client") == "" {
+			http.Error(w, `{"error":"missing X-DefenseClaw-Client header"}`, http.StatusForbidden)
+			return
+		}
+
+		ct := r.Header.Get("Content-Type")
+		if !strings.Contains(ct, "application/json") {
+			http.Error(w, `{"error":"Content-Type must be application/json"}`, http.StatusUnsupportedMediaType)
+			return
+		}
+
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if !isLocalhostOrigin(origin) {
+				http.Error(w, `{"error":"non-localhost Origin rejected"}`, http.StatusForbidden)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLocalhostOrigin(origin string) bool {
+	for _, prefix := range []string{
+		"http://127.0.0.1", "http://localhost",
+		"http://[::1]", "https://127.0.0.1",
+		"https://localhost", "https://[::1]",
+	} {
+		if strings.HasPrefix(origin, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *APIServer) writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func toEnforcementEntries(entries []audit.ActionEntry) []enforcementEntry {
+	out := make([]enforcementEntry, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, enforcementEntry{
+			ID:         entry.ID,
+			TargetType: entry.TargetType,
+			TargetName: entry.TargetName,
+			Reason:     entry.Reason,
+			UpdatedAt:  entry.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func (a *APIServer) blockListEntries() []policy.ListEntry {
+	return a.policyListEntries(true)
+}
+
+func (a *APIServer) allowListEntries() []policy.ListEntry {
+	return a.policyListEntries(false)
+}
+
+func (a *APIServer) policyListEntries(blocked bool) []policy.ListEntry {
+	if a.store == nil {
+		return nil
+	}
+
+	pe := enforce.NewPolicyEngine(a.store)
+	var (
+		actions []audit.ActionEntry
+		err     error
+	)
+	if blocked {
+		actions, err = pe.ListBlocked()
+	} else {
+		actions, err = pe.ListAllowed()
+	}
+	if err != nil {
+		return nil
+	}
+
+	entries := make([]policy.ListEntry, 0, len(actions))
+	for _, action := range actions {
+		entries = append(entries, policy.ListEntry{
+			TargetType: action.TargetType,
+			TargetName: action.TargetName,
+			Reason:     action.Reason,
+		})
+	}
+	return entries
+}
+
+func (a *APIServer) evaluateAdmissionPolicy(ctx context.Context, input policy.AdmissionInput) (*policy.AdmissionOutput, error) {
+	if a.scannerCfg != nil && a.scannerCfg.PolicyDir != "" {
+		engine, err := policy.New(a.scannerCfg.PolicyDir)
+		if err == nil {
+			out, evalErr := engine.Evaluate(ctx, input)
+			if evalErr == nil {
+				return out, nil
+			}
+		}
+	}
+
+	if blocked, reason := findPolicyListEntry(input.BlockList, input.TargetType, input.TargetName); blocked {
+		return &policy.AdmissionOutput{Verdict: "blocked", Reason: reason}, nil
+	}
+	if allowed, reason := findPolicyListEntry(input.AllowList, input.TargetType, input.TargetName); allowed {
+		return &policy.AdmissionOutput{Verdict: "allowed", Reason: reason}, nil
+	}
+	if input.ScanResult == nil {
+		return &policy.AdmissionOutput{Verdict: "scan", Reason: "scan required"}, nil
+	}
+	if input.ScanResult.TotalFindings <= 0 {
+		return &policy.AdmissionOutput{Verdict: "clean", Reason: "scan clean"}, nil
+	}
+	if input.ScanResult.MaxSeverity == "HIGH" || input.ScanResult.MaxSeverity == "CRITICAL" {
+		return &policy.AdmissionOutput{
+			Verdict: "rejected",
+			Reason:  fmt.Sprintf("max severity %s triggers block", input.ScanResult.MaxSeverity),
+		}, nil
+	}
+	return &policy.AdmissionOutput{
+		Verdict: "warning",
+		Reason:  "findings present — allowed with warning",
+	}, nil
+}
+
+func findPolicyListEntry(entries []policy.ListEntry, targetType, targetName string) (bool, string) {
+	for _, entry := range entries {
+		if entry.TargetType == targetType && entry.TargetName == targetName {
+			if entry.Reason != "" {
+				return true, entry.Reason
+			}
+			return true, fmt.Sprintf("%s %q matched policy list", targetType, targetName)
+		}
+	}
+	return false, ""
 }

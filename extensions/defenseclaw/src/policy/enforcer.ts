@@ -1,14 +1,63 @@
+import { execFile } from "node:child_process";
 import { DaemonClient } from "../client.js";
 import { scanPlugin } from "../scanners/plugin_scanner/index.js";
 import { scanMCPServer } from "../scanners/mcp-scanner.js";
 import type {
   ScanResult,
+  Finding,
   Verdict,
   AdmissionResult,
   InstallType,
   Severity,
 } from "../types.js";
 import { compareSeverity, maxSeverity } from "../types.js";
+
+export function runSkillScan(
+  target: string,
+  timeoutMs = 120_000,
+): Promise<ScanResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "defenseclaw",
+      ["skill", "scan", target, "--json"],
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const code = error && "code" in error ? (error.code as number) : 0;
+        if (code !== 0 && !stdout.trim()) {
+          reject(
+            new Error(
+              `defenseclaw skill scan exited ${code}: ${stderr.trim().slice(0, 200)}`,
+            ),
+          );
+          return;
+        }
+        try {
+          const data = JSON.parse(stdout);
+          const findings: Finding[] = (data.findings ?? []).map(
+            (f: Record<string, unknown>) => ({
+              id: (f.id as string) ?? "",
+              severity: (f.severity as string) ?? "INFO",
+              title: (f.title as string) ?? "",
+              description: (f.description as string) ?? "",
+              location: (f.location as string) ?? "",
+              remediation: (f.remediation as string) ?? "",
+              scanner: (f.scanner as string) ?? "skill-scanner",
+              tags: (f.tags as string[]) ?? [],
+            }),
+          );
+          resolve({
+            scanner: "skill-scanner",
+            target,
+            timestamp: new Date().toISOString(),
+            findings,
+          });
+        } catch {
+          reject(new Error("failed to parse skill scan output"));
+        }
+      },
+    );
+  });
+}
 
 export interface EnforcerConfig {
   blockOnSeverity: Severity;
@@ -33,9 +82,10 @@ export class PolicyEnforcer {
   private readonly localBlockList = new Map<string, string>();
   private readonly localAllowList = new Map<string, string>();
 
-  constructor(config?: Partial<EnforcerConfig>) {
+  constructor(config?: Partial<EnforcerConfig>, client?: DaemonClient) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.client = new DaemonClient({ baseUrl: this.config.daemonUrl });
+    this.client =
+      client ?? new DaemonClient({ baseUrl: this.config.daemonUrl });
   }
 
   async evaluatePlugin(
@@ -44,6 +94,15 @@ export class PolicyEnforcer {
   ): Promise<AdmissionResult> {
     return this.evaluate("plugin", pluginName, pluginDir, () =>
       scanPlugin(pluginDir),
+    );
+  }
+
+  async evaluateSkill(
+    skillDir: string,
+    skillName: string,
+  ): Promise<AdmissionResult> {
+    return this.evaluate("skill", skillName, skillDir, () =>
+      runSkillScan(skillDir),
     );
   }
 

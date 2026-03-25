@@ -614,5 +614,62 @@ class TestInitGuardrailInstall(unittest.TestCase):
         logger.log_action.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# _report_to_sidecar graceful failure tests
+# ---------------------------------------------------------------------------
+
+class TestReportToSidecar(unittest.TestCase):
+    """Test the fire-and-forget sidecar reporter in the guardrail module."""
+
+    def _make_guardrail(self):
+        """Create a DefenseClawGuardrail with mocked litellm imports."""
+        guardrails_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "guardrails")
+        )
+        sys.path.insert(0, guardrails_dir)
+        try:
+            from defenseclaw_guardrail import DefenseClawGuardrail
+        finally:
+            sys.path.pop(0)
+        return DefenseClawGuardrail
+
+    @patch.dict(os.environ, {}, clear=False)
+    def test_no_op_when_api_port_not_set(self):
+        """_report_to_sidecar should silently return when DEFENSECLAW_API_PORT is unset."""
+        os.environ.pop("DEFENSECLAW_API_PORT", None)
+        try:
+            GuardrailCls = self._make_guardrail()
+        except ImportError:
+            self.skipTest("litellm not installed")
+        g = GuardrailCls.__new__(GuardrailCls)
+        g.mode = "observe"
+        verdict = {"action": "allow", "severity": "NONE", "reason": "", "findings": []}
+        g._report_to_sidecar("prompt", "gpt-4", verdict, 1.0)
+
+    @patch.dict(os.environ, {"DEFENSECLAW_API_PORT": "19999"})
+    def test_graceful_on_connection_refused(self):
+        """_report_to_sidecar should not raise when the sidecar is unreachable."""
+        try:
+            GuardrailCls = self._make_guardrail()
+        except ImportError:
+            self.skipTest("litellm not installed")
+        g = GuardrailCls.__new__(GuardrailCls)
+        g.mode = "observe"
+        verdict = {"action": "block", "severity": "HIGH", "reason": "test", "findings": ["test"]}
+        g._report_to_sidecar("prompt", "gpt-4", verdict, 2.0, tokens_in=100, tokens_out=50)
+
+    @patch.dict(os.environ, {"DEFENSECLAW_API_PORT": "abc"})
+    def test_graceful_on_invalid_port(self):
+        """_report_to_sidecar should not raise when port is non-numeric."""
+        try:
+            GuardrailCls = self._make_guardrail()
+        except ImportError:
+            self.skipTest("litellm not installed")
+        g = GuardrailCls.__new__(GuardrailCls)
+        g.mode = "observe"
+        verdict = {"action": "allow", "severity": "NONE", "reason": "", "findings": []}
+        g._report_to_sidecar("completion", "gpt-4", verdict, 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

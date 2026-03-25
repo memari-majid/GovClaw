@@ -1,12 +1,15 @@
 package daemon
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -40,16 +43,76 @@ func New(dataDir string) *Daemon {
 func (d *Daemon) PIDFile() string { return d.pidFile }
 func (d *Daemon) LogFile() string { return d.logFile }
 
+type pidInfo struct {
+	PID        int    `json:"pid"`
+	Executable string `json:"executable"`
+	StartTime  int64  `json:"start_time"`
+}
+
 func (d *Daemon) IsRunning() (bool, int) {
-	pid, err := d.readPID()
+	info, err := d.readPIDInfo()
 	if err != nil {
 		return false, 0
 	}
-	if !processExists(pid) {
+	if !processExists(info.PID) {
 		_ = os.Remove(d.pidFile)
 		return false, 0
 	}
-	return true, pid
+	if !d.verifyProcess(info) {
+		_ = os.Remove(d.pidFile)
+		return false, 0
+	}
+	return true, info.PID
+}
+
+func (d *Daemon) verifyProcess(info pidInfo) bool {
+	switch runtime.GOOS {
+	case "linux":
+		return d.verifyProcessLinux(info)
+	case "darwin":
+		return d.verifyProcessDarwin(info)
+	default:
+		return true
+	}
+}
+
+func (d *Daemon) verifyProcessLinux(info pidInfo) bool {
+	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", info.PID))
+	if err != nil {
+		return true
+	}
+	if info.Executable != "" && exePath != info.Executable {
+		return false
+	}
+	return true
+}
+
+func (d *Daemon) verifyProcessDarwin(info pidInfo) bool {
+	comm, err := processExecutableDarwin(info.PID)
+	if err != nil {
+		// Match the Linux behavior: if process metadata is unavailable in the
+		// current environment, fall back to the liveness check done by IsRunning.
+		return processExists(info.PID)
+	}
+	if info.Executable != "" {
+		exeBase := filepath.Base(info.Executable)
+		if !strings.HasSuffix(comm, exeBase) && comm != exeBase {
+			return false
+		}
+	}
+	return true
+}
+
+func processExecutableDarwin(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return "", err
+	}
+	comm := strings.TrimSpace(string(out))
+	if comm == "" {
+		return "", fmt.Errorf("daemon: ps returned empty command for pid %d", pid)
+	}
+	return comm, nil
 }
 
 func (d *Daemon) Start(args []string) (int, error) {
@@ -99,7 +162,7 @@ func (d *Daemon) Start(args []string) (int, error) {
 
 	pid := cmd.Process.Pid
 
-	if err := d.writePID(pid); err != nil {
+	if err := d.writePIDInfo(pid, executable); err != nil {
 		_ = cmd.Process.Kill()
 		devNull.Close()
 		logFile.Close()
@@ -174,20 +237,34 @@ func (d *Daemon) Restart(args []string, timeout time.Duration) (int, error) {
 	return d.Start(args)
 }
 
-func (d *Daemon) readPID() (int, error) {
+func (d *Daemon) readPIDInfo() (pidInfo, error) {
 	data, err := os.ReadFile(d.pidFile)
 	if err != nil {
-		return 0, err
+		return pidInfo{}, err
 	}
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		return 0, err
+
+	var info pidInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr != nil || pid <= 0 {
+			return pidInfo{}, fmt.Errorf("daemon: pid file is neither JSON nor a valid PID number: %w", err)
+		}
+		return pidInfo{PID: pid}, nil
 	}
-	return pid, nil
+	return info, nil
 }
 
-func (d *Daemon) writePID(pid int) error {
-	return os.WriteFile(d.pidFile, []byte(strconv.Itoa(pid)), 0644)
+func (d *Daemon) writePIDInfo(pid int, executable string) error {
+	info := pidInfo{
+		PID:        pid,
+		Executable: executable,
+		StartTime:  time.Now().Unix(),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(d.pidFile, data, 0644)
 }
 
 func processExists(pid int) bool {

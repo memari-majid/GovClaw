@@ -113,9 +113,14 @@ class PluginScannerWrapper:
                 pass
 
         if proc.returncode != 0 and not findings:
-            stderr = proc.stderr.strip()
-            if stderr:
-                print(f"warning: plugin scanner: {stderr}", file=sys.stderr)
+            stderr_msg = proc.stderr.strip()[:200] if proc.stderr else "unknown error"
+            findings.append(Finding(
+                id="scanner-error",
+                severity="ERROR",
+                title=f"Plugin scanner exited with code {proc.returncode}",
+                description=stderr_msg,
+                scanner="plugin-scanner",
+            ))
 
         return ScanResult(
             scanner="plugin-scanner",

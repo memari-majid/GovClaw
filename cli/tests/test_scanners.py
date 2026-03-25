@@ -107,14 +107,17 @@ class TestMCPScannerWrapper(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
     @patch("defenseclaw.scanner.mcp.subprocess.run")
-    def test_scan_invalid_json(self, mock_run):
+    def test_scan_nonzero_exit_reports_error(self, mock_run):
         from defenseclaw.scanner.mcp import MCPScannerWrapper
 
-        mock_run.return_value = MagicMock(returncode=1, stdout="ERROR: something", stderr="")
+        mock_run.return_value = MagicMock(returncode=1, stdout="ERROR: something", stderr="crash details")
         s = MCPScannerWrapper()
         result = s.scan("http://localhost:3000")
 
-        self.assertTrue(result.is_clean())
+        self.assertFalse(result.is_clean())
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].severity, "ERROR")
+        self.assertIn("exited with code 1", result.findings[0].title)
 
 
 class TestSkillScannerWrapper(unittest.TestCase):
@@ -205,10 +208,18 @@ class TestSkillScannerWrapper(unittest.TestCase):
     def test_scan_raises_system_exit_on_import_error(self):
         from defenseclaw.config import SkillScannerConfig
         from defenseclaw.scanner.skill import SkillScannerWrapper
+        import builtins
 
         s = SkillScannerWrapper(SkillScannerConfig())
-        with self.assertRaises(SystemExit):
-            s.scan("/tmp/nonexistent")
+        real_import = builtins.__import__
+        def fake_import(name, *args, **kwargs):
+            if name == "skill_scanner" or name.startswith("skill_scanner."):
+                raise ImportError(f"mocked: no module named {name}")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=fake_import):
+            with self.assertRaises(SystemExit):
+                s.scan("/tmp/nonexistent")
 
     @patch("defenseclaw.scanner.skill.SkillScannerWrapper._convert")
     def test_scan_with_mocked_sdk(self, mock_convert):

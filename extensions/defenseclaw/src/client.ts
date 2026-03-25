@@ -8,13 +8,16 @@ import type {
   AdmissionResult,
 } from "./types.js";
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:18789";
+const DEFAULT_BASE_URL =
+  process.env["DEFENSECLAW_DAEMON_URL"] || "http://127.0.0.1:18790";
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+type RequestImpl = typeof httpRequest;
 
 interface ClientOptions {
   baseUrl?: string;
   timeoutMs?: number;
+  requestImpl?: RequestImpl;
 }
 
 interface ApiResponse<T> {
@@ -27,10 +30,12 @@ interface ApiResponse<T> {
 export class DaemonClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly requestImpl: RequestImpl;
 
   constructor(opts?: ClientOptions) {
     this.baseUrl = opts?.baseUrl ?? DEFAULT_BASE_URL;
     this.timeoutMs = opts?.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.requestImpl = opts?.requestImpl ?? httpRequest;
   }
 
   async status(): Promise<ApiResponse<DaemonStatus>> {
@@ -130,7 +135,7 @@ export class DaemonClient {
       const url = new URL(path, this.baseUrl);
       const payload = body !== undefined ? JSON.stringify(body) : undefined;
 
-      const req = httpRequest(
+      const req = this.requestImpl(
         {
           hostname: url.hostname,
           port: url.port,
@@ -140,6 +145,7 @@ export class DaemonClient {
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json",
+            "X-DefenseClaw-Client": "openclaw-plugin",
             ...(payload !== undefined
               ? { "Content-Length": Buffer.byteLength(payload) }
               : {}),

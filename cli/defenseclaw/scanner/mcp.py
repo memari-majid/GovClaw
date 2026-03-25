@@ -35,6 +35,21 @@ class MCPScannerWrapper:
             )
             raise SystemExit(1)
 
+        if proc.returncode != 0:
+            stderr_msg = proc.stderr.strip()[:200] if proc.stderr else "unknown error"
+            return ScanResult(
+                scanner="mcp-scanner",
+                target=target,
+                timestamp=datetime.now(timezone.utc),
+                findings=[Finding(
+                    id="scanner-error",
+                    severity="ERROR",
+                    title=f"MCP scanner exited with code {proc.returncode}",
+                    description=stderr_msg,
+                    scanner="mcp-scanner",
+                )],
+            )
+
         findings: list[Finding] = []
         if proc.stdout.strip():
             try:

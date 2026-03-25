@@ -1,146 +1,191 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createServer } from "node:http";
-import type { Server, IncomingMessage, ServerResponse } from "node:http";
-import { PolicyEnforcer } from "../policy/enforcer.js";
+import { DaemonClient } from "../client.js";
+import { PolicyEnforcer, type EnforcerConfig } from "../policy/enforcer.js";
 
 let tempDir: string;
-let server: Server;
-let port: number;
 const requests: Array<{ method: string; url: string; body: string }> = [];
+let mockClient: DaemonClient;
 
 let blockedList: Array<{
   id: string;
   target_type: string;
   target_name: string;
   reason: string;
-  created_at: string;
+  updated_at: string;
 }> = [];
 let allowedList: typeof blockedList = [];
+
+class MockDaemonClient {
+  async submitScanResult(result: unknown) {
+    requests.push({
+      method: "POST",
+      url: "/scan/result",
+      body: JSON.stringify(result),
+    });
+    return { ok: true, status: 200 };
+  }
+
+  async block(targetType: string, targetName: string, reason: string) {
+    requests.push({
+      method: "POST",
+      url: "/enforce/block",
+      body: JSON.stringify({
+        target_type: targetType,
+        target_name: targetName,
+        reason,
+      }),
+    });
+    blockedList.push({
+      id: String(blockedList.length + 1),
+      target_type: targetType,
+      target_name: targetName,
+      reason,
+      updated_at: new Date().toISOString(),
+    });
+    allowedList = allowedList.filter(
+      (entry) =>
+        !(
+          entry.target_type === targetType && entry.target_name === targetName
+        ),
+    );
+    return { ok: true, status: 200 };
+  }
+
+  async allow(targetType: string, targetName: string, reason: string) {
+    requests.push({
+      method: "POST",
+      url: "/enforce/allow",
+      body: JSON.stringify({
+        target_type: targetType,
+        target_name: targetName,
+        reason,
+      }),
+    });
+    allowedList.push({
+      id: String(allowedList.length + 1),
+      target_type: targetType,
+      target_name: targetName,
+      reason,
+      updated_at: new Date().toISOString(),
+    });
+    blockedList = blockedList.filter(
+      (entry) =>
+        !(
+          entry.target_type === targetType && entry.target_name === targetName
+        ),
+    );
+    return { ok: true, status: 200 };
+  }
+
+  async unblock(targetType: string, targetName: string) {
+    requests.push({
+      method: "DELETE",
+      url: "/enforce/block",
+      body: JSON.stringify({
+        target_type: targetType,
+        target_name: targetName,
+      }),
+    });
+    blockedList = blockedList.filter(
+      (entry) =>
+        !(
+          entry.target_type === targetType && entry.target_name === targetName
+        ),
+    );
+    return { ok: true, status: 200 };
+  }
+
+  async listBlocked() {
+    requests.push({ method: "GET", url: "/enforce/blocked", body: "" });
+    return { ok: true, status: 200, data: blockedList };
+  }
+
+  async listAllowed() {
+    requests.push({ method: "GET", url: "/enforce/allowed", body: "" });
+    return { ok: true, status: 200, data: allowedList };
+  }
+
+  async logEvent(event: unknown) {
+    requests.push({
+      method: "POST",
+      url: "/audit/event",
+      body: JSON.stringify(event),
+    });
+    return { ok: true, status: 200 };
+  }
+
+  async evaluatePolicy(domain: string, input: Record<string, unknown>) {
+    requests.push({
+      method: "POST",
+      url: "/policy/evaluate",
+      body: JSON.stringify({ domain, input }),
+    });
+
+    const isBlocked = blockedList.some(
+      (entry) =>
+        entry.target_type === input.target_type &&
+        entry.target_name === input.target_name,
+    );
+    const isAllowed = allowedList.some(
+      (entry) =>
+        entry.target_type === input.target_type &&
+        entry.target_name === input.target_name,
+    );
+
+    let verdict = "scan";
+    let reason = "awaiting scan";
+    const scanResult = input.scan_result as
+      | { max_severity?: string; total_findings?: number }
+      | undefined;
+
+    if (isBlocked) {
+      verdict = "blocked";
+      reason = `${input.target_type as string} '${input.target_name as string}' blocked by daemon policy`;
+    } else if (isAllowed) {
+      verdict = "allowed";
+      reason = "allow-listed";
+    } else if (scanResult && scanResult.total_findings === 0) {
+      verdict = "clean";
+      reason = "scan clean";
+    } else if (
+      scanResult &&
+      ["HIGH", "CRITICAL"].includes(scanResult.max_severity ?? "")
+    ) {
+      verdict = "rejected";
+      reason = `max severity ${scanResult.max_severity} triggers block`;
+    } else if ((scanResult?.total_findings ?? 0) > 0) {
+      verdict = "warning";
+      reason = "findings present — allowed with warning";
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        data: { verdict, reason },
+      },
+    };
+  }
+}
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "dc-enforcer-test-"));
   requests.length = 0;
   blockedList = [];
   allowedList = [];
-
-  await new Promise<void>((resolve) => {
-    server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      const chunks: Buffer[] = [];
-      req.on("data", (c: Buffer) => chunks.push(c));
-      req.on("end", () => {
-        const body = Buffer.concat(chunks).toString("utf-8");
-        requests.push({ method: req.method ?? "", url: req.url ?? "", body });
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-
-        if (req.url === "/enforce/block" && req.method === "POST") {
-          const payload = JSON.parse(body || "{}");
-          blockedList.push({
-            id: String(blockedList.length + 1),
-            target_type: payload.target_type || "",
-            target_name: payload.target_name || "",
-            reason: payload.reason || "",
-            created_at: new Date().toISOString(),
-          });
-          allowedList = allowedList.filter(
-            (e) =>
-              !(
-                e.target_type === payload.target_type &&
-                e.target_name === payload.target_name
-              ),
-          );
-          res.end(JSON.stringify({ ok: true }));
-        } else if (req.url === "/enforce/allow" && req.method === "POST") {
-          const payload = JSON.parse(body || "{}");
-          allowedList.push({
-            id: String(allowedList.length + 1),
-            target_type: payload.target_type || "",
-            target_name: payload.target_name || "",
-            reason: payload.reason || "",
-            created_at: new Date().toISOString(),
-          });
-          blockedList = blockedList.filter(
-            (e) =>
-              !(
-                e.target_type === payload.target_type &&
-                e.target_name === payload.target_name
-              ),
-          );
-          res.end(JSON.stringify({ ok: true }));
-        } else if (req.url === "/enforce/blocked") {
-          res.end(JSON.stringify(blockedList));
-        } else if (req.url === "/enforce/allowed") {
-          res.end(JSON.stringify(allowedList));
-        } else if (req.url === "/policy/evaluate" && req.method === "POST") {
-          const payload = JSON.parse(body || "{}");
-          const inp = payload.input || {};
-          const isBlocked = blockedList.some(
-            (e: { target_type: string; target_name: string }) =>
-              e.target_type === inp.target_type &&
-              e.target_name === inp.target_name,
-          );
-          const isAllowed = allowedList.some(
-            (e: { target_type: string; target_name: string }) =>
-              e.target_type === inp.target_type &&
-              e.target_name === inp.target_name,
-          );
-          let verdict = "scan";
-          let reason = "awaiting scan";
-          if (isBlocked) {
-            verdict = "blocked";
-            reason = `${inp.target_type} '${inp.target_name}' blocked by daemon policy`;
-          } else if (isAllowed) {
-            verdict = "allowed";
-            reason = "allow-listed";
-          } else if (inp.scan_result && inp.scan_result.total_findings === 0) {
-            verdict = "clean";
-            reason = "scan clean";
-          } else if (
-            inp.scan_result &&
-            ["HIGH", "CRITICAL"].includes(inp.scan_result.max_severity)
-          ) {
-            verdict = "rejected";
-            reason = `max severity ${inp.scan_result.max_severity} triggers block`;
-          } else if (
-            inp.scan_result &&
-            inp.scan_result.total_findings > 0
-          ) {
-            verdict = "warning";
-            reason = "findings present — allowed with warning";
-          }
-          res.end(
-            JSON.stringify({
-              ok: true,
-              data: { verdict, reason },
-            }),
-          );
-        } else {
-          res.end("{}");
-        }
-      });
-    });
-
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve();
-    });
-  });
+  mockClient = new MockDaemonClient() as unknown as DaemonClient;
 });
 
 afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
-  await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-function makeEnforcer(overrides?: Record<string, unknown>) {
-  return new PolicyEnforcer({
-    daemonUrl: `http://127.0.0.1:${port}`,
-    ...overrides,
-  });
+function makeEnforcer(overrides?: Partial<EnforcerConfig>) {
+  return new PolicyEnforcer(overrides, mockClient);
 }
 
 describe("PolicyEnforcer", () => {
@@ -188,7 +233,7 @@ describe("PolicyEnforcer", () => {
           target_type: "skill",
           target_name: "blocked-skill",
           reason: "daemon blocked",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
       allowedList = [
@@ -197,7 +242,7 @@ describe("PolicyEnforcer", () => {
           target_type: "mcp",
           target_name: "allowed-mcp",
           reason: "daemon allowed",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
 
@@ -229,7 +274,7 @@ describe("PolicyEnforcer", () => {
           target_type: "plugin",
           target_name: "daemon-blocked",
           reason: "blocked by admin",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
 

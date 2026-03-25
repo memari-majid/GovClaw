@@ -9,10 +9,12 @@ Operates in two modes (set via DEFENSECLAW_GUARDRAIL_MODE env var):
 
 from __future__ import annotations
 
+import json
 import os
 import time
+import urllib.request
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
 
@@ -94,8 +96,8 @@ class DefenseClawGuardrail(CustomGuardrail):
         user_api_key_dict: UserAPIKeyAuth,
         cache: DualCache,
         data: dict[str, Any],
-        call_type: Optional[Any] = None,
-    ) -> Optional[Union[Exception, str, dict[str, Any]]]:
+        call_type: Any | None = None,
+    ) -> Exception | str | dict[str, Any] | None:
         messages = data.get("messages", [])
         text = self._messages_to_text(messages)
         if not text:
@@ -113,6 +115,7 @@ class DefenseClawGuardrail(CustomGuardrail):
         reason = verdict.get("reason", "")
 
         self._log_pre_call(ts, model, messages, severity, action, reason, elapsed_ms)
+        self._report_to_sidecar("prompt", model, verdict, elapsed_ms)
 
         if action == "block" and self.mode == "action":
             data["mock_response"] = self._block_message("prompt", reason)
@@ -170,8 +173,61 @@ class DefenseClawGuardrail(CustomGuardrail):
             usage, elapsed_ms,
         )
 
+        t_in = getattr(usage, "prompt_tokens", None) if usage else None
+        t_out = getattr(usage, "completion_tokens", None) if usage else None
+        self._report_to_sidecar(
+            "completion", model, verdict, elapsed_ms,
+            tokens_in=t_in, tokens_out=t_out,
+        )
+
         if action == "block" and self.mode == "action":
             self._replace_response(response, reason)
+
+    # ------------------------------------------------------------------
+    # Sidecar telemetry reporter
+    # ------------------------------------------------------------------
+
+    def _report_to_sidecar(
+        self,
+        direction: str,
+        model: str,
+        verdict: dict[str, Any],
+        elapsed_ms: float,
+        *,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+    ) -> None:
+        """Fire-and-forget POST to the Go sidecar's guardrail event endpoint."""
+        port = os.environ.get("DEFENSECLAW_API_PORT")
+        if not port:
+            return
+        try:
+            payload: dict[str, Any] = {
+                "direction": direction,
+                "model": model,
+                "action": verdict.get("action", "allow"),
+                "severity": verdict.get("severity", "NONE"),
+                "reason": verdict.get("reason", ""),
+                "findings": verdict.get("findings", []),
+                "elapsed_ms": elapsed_ms,
+            }
+            if tokens_in is not None:
+                payload["tokens_in"] = tokens_in
+            if tokens_out is not None:
+                payload["tokens_out"] = tokens_out
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{int(port)}/v1/guardrail/event",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-DefenseClaw-Client": "litellm-guardrail",
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Logging

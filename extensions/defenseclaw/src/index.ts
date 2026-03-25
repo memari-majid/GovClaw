@@ -5,8 +5,7 @@
  *
  * Boot-time:
  *  - Syncs block/allow lists from the Go daemon
- *  - Starts the filesystem watcher as a background service
- *  - On gateway_start: runs native TS scans on all plugins and MCP servers
+ *  - Verifies sidecar reachability on gateway_start
  *
  * Lifecycle hooks:
  *  - skill_install / skill_uninstall: admission gate for skills
@@ -24,37 +23,17 @@
  */
 
 import { definePluginEntry } from "@openclaw/plugin-sdk";
-import { spawn, execFile } from "node:child_process";
-import type { ChildProcess } from "node:child_process";
 import { DaemonClient } from "./client.js";
-import { PolicyEnforcer } from "./policy/enforcer.js";
+import { PolicyEnforcer, runSkillScan } from "./policy/enforcer.js";
 import { scanPlugin } from "./scanners/plugin_scanner/index.js";
 import { scanMCPServer } from "./scanners/mcp-scanner.js";
 import type {
   ScanResult,
-  ScanReport,
   AdmissionResult,
   Finding,
   InstallType,
 } from "./types.js";
 import { compareSeverity, maxSeverity } from "./types.js";
-
-function runDefenseClaw(
-  args: string[],
-  timeoutMs = 300_000,
-): Promise<{ stdout: string; stderr: string; code: number }> {
-  return new Promise((resolve) => {
-    execFile(
-      "defenseclaw",
-      args,
-      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        const code = error && "code" in error ? (error.code as number) : 0;
-        resolve({ stdout: stdout.toString(), stderr: stderr.toString(), code });
-      },
-    );
-  });
-}
 
 function formatFindings(findings: Finding[], limit = 15): string[] {
   const lines: string[] = [];
@@ -89,44 +68,24 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
   const client = new DaemonClient();
   const enforcer = new PolicyEnforcer();
 
-  let watcherProc: ChildProcess | null = null;
-
-  // ─── Background service: filesystem watcher ───
+  // ─── Background service: sync block/allow lists from sidecar ───
 
   registerService("defenseclaw-watcher", {
     start: async () => {
-      enforcer.syncFromDaemon().catch(() => {});
-
-      watcherProc = spawn("defenseclaw", ["watch", "--json-events"], {
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      watcherProc.stdout?.on("data", (chunk: Buffer) => {
-        const lines = chunk.toString().split("\n").filter(Boolean);
-        for (const line of lines) {
-          try {
-            const evt: AdmissionResult = JSON.parse(line);
-            console.log(`[defenseclaw] ${formatAdmissionResult(evt)}`);
-          } catch {
-            // non-JSON output from watcher
-          }
-        }
-      });
-
-      watcherProc.stderr?.on("data", (chunk: Buffer) => {
-        console.error(`[defenseclaw-watcher] ${chunk.toString().trimEnd()}`);
-      });
-
-      watcherProc.on("exit", (code) => {
-        console.log(`[defenseclaw-watcher] exited with code ${code}`);
-        watcherProc = null;
-      });
+      try {
+        await enforcer.syncFromDaemon();
+        console.log("[defenseclaw] block/allow lists synced from sidecar");
+      } catch (err) {
+        console.error(
+          `[defenseclaw] failed to sync from sidecar: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(
+          "[defenseclaw] WARNING: operating without daemon sync — enforcement may be stale",
+        );
+      }
 
       return {
-        stop: () => {
-          watcherProc?.kill("SIGTERM");
-          watcherProc = null;
-        },
+        stop: () => undefined,
       };
     },
   });
@@ -134,54 +93,36 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
   // ─── Lifecycle: gateway_start ───
 
   api.on("gateway_start", async () => {
-    console.log("[defenseclaw] gateway started — running boot scans...");
+    console.log("[defenseclaw] gateway started — syncing state from sidecar...");
 
-    const cliScan = runDefenseClaw(["scan", "--json"]).then(({ stdout, code }) => {
-      if (code !== 0) {
-        console.error("[defenseclaw] CLI scan failed on boot");
-        return;
-      }
-      try {
-        const report: ScanReport = JSON.parse(stdout);
-        if (report.clean) {
-          console.log("[defenseclaw] CLI scan: all clean");
-        } else {
-          console.log(
-            `[defenseclaw] CLI scan: ${report.total_findings} findings (max: ${report.max_severity})`,
-          );
-          for (const r of report.results) {
-            const critical = r.findings.filter(
-              (f) =>
-                f.severity === "CRITICAL" || f.severity === "HIGH",
-            );
-            if (critical.length > 0) {
-              console.log(
-                `[defenseclaw] ${r.scanner}: ${critical.length} HIGH/CRITICAL in ${r.target}`,
-              );
-            }
-          }
-        }
-      } catch {
-        console.error("[defenseclaw] failed to parse CLI scan report");
-      }
+    const health = await client.status();
+    if (health.ok) {
+      console.log("[defenseclaw] sidecar is reachable");
+    } else {
+      console.error(
+        `[defenseclaw] WARNING: sidecar unreachable (${health.error ?? "unknown"}) — ` +
+        "enforcement will use local cache only. Ensure defenseclaw-gateway is running.",
+      );
+    }
+
+    await enforcer.syncFromDaemon().catch(() => {
+      console.error("[defenseclaw] failed to sync block/allow lists from sidecar");
     });
-
-    await cliScan;
   });
 
   // ─── Lifecycle: skill install/uninstall ───
 
-  api.on("skill_install", async (event: { name: string; path: string }) => {
+  api.guard("skill_install", async (event: { name: string; path: string }) => {
     console.log(`[defenseclaw] skill install detected: ${event.name}`);
 
-    const result = await enforcer.evaluatePlugin(event.path, event.name);
+    const result = await enforcer.evaluateSkill(event.path, event.name);
     console.log(`[defenseclaw] ${formatAdmissionResult(result)}`);
 
-    if (result.verdict === "rejected" || result.verdict === "blocked") {
-      console.log(
-        `[defenseclaw] BLOCKED skill "${event.name}": ${result.reason}`,
-      );
+    if (result.verdict === "rejected" || result.verdict === "blocked" || result.verdict === "scan-error") {
+      return { allow: false, reason: result.reason };
     }
+
+    return { allow: true };
   });
 
   api.on("skill_uninstall", async (event: { name: string; path: string }) => {
@@ -199,7 +140,7 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
 
   // ─── Lifecycle: MCP connect/disconnect ───
 
-  api.on("mcp_connect", async (event: { name: string; config_path?: string }) => {
+  api.guard("mcp_connect", async (event: { name: string; config_path?: string }) => {
     console.log(`[defenseclaw] MCP server connecting: ${event.name}`);
 
     if (event.config_path) {
@@ -208,11 +149,17 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
         event.name,
       );
       console.log(`[defenseclaw] ${formatAdmissionResult(result)}`);
+
+      if (result.verdict === "rejected" || result.verdict === "blocked" || result.verdict === "scan-error") {
+        return { allow: false, reason: result.reason };
+      }
     } else {
       console.log(
         `[defenseclaw] MCP "${event.name}" connected (no config path — skipping scan)`,
       );
     }
+
+    return { allow: true };
   });
 
   api.on("mcp_disconnect", async (event: { name: string }) => {
@@ -332,39 +279,13 @@ async function handleMCPScan(target: string): Promise<{ text: string }> {
 }
 
 async function handleSkillScan(target: string): Promise<{ text: string }> {
-  const { stdout, stderr, code } = await runDefenseClaw([
-    "skill",
-    "scan",
-    target,
-    "--json",
-  ]);
-
-  if (code !== 0) {
-    return { text: `Scan failed:\n\`\`\`\n${stderr}\n\`\`\`` };
-  }
-
   try {
-    const report: ScanReport = JSON.parse(stdout);
-    const lines: string[] = [`**DefenseClaw Scan: ${target}**\n`];
-
-    if (report.clean) {
-      lines.push("Verdict: **CLEAN**");
-    } else {
-      lines.push(
-        `Verdict: **${report.max_severity}** (${report.total_findings} findings)\n`,
-      );
-
-      for (const result of report.results ?? []) {
-        if (result.findings.length > 0) {
-          lines.push(`\n**${result.scanner}:**`);
-          lines.push(...formatFindings(result.findings, 10));
-        }
-      }
-    }
-
-    return { text: lines.join("\n") };
-  } catch {
-    return { text: `Scan output:\n\`\`\`\n${stdout}\n\`\`\`` };
+    const result = await runSkillScan(target);
+    return { text: formatScanOutput("Skill", target, result) };
+  } catch (err) {
+    return {
+      text: `Skill scan failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 

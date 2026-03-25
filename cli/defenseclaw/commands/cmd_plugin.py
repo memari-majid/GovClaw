@@ -209,13 +209,21 @@ def list_plugins(app: AppContext) -> None:
 def remove(app: AppContext, name: str) -> None:
     """Remove an installed plugin."""
     plugin_dir = app.cfg.plugin_dir
-    path = os.path.join(plugin_dir, name)
+    safe_name = os.path.basename(name)
+    if not safe_name or safe_name in (".", ".."):
+        click.echo(f"Invalid plugin name: {name}", err=True)
+        raise SystemExit(1)
+
+    path = os.path.realpath(os.path.join(plugin_dir, safe_name))
+    if not path.startswith(os.path.realpath(plugin_dir) + os.sep):
+        click.echo(f"Invalid plugin name: {name}", err=True)
+        raise SystemExit(1)
 
     if not os.path.isdir(path):
-        click.echo(f"Plugin not found: {name}")
+        click.echo(f"Plugin not found: {safe_name}")
         return
 
     shutil.rmtree(path)
-    click.echo(f"Removed plugin: {name}")
+    click.echo(f"Removed plugin: {safe_name}")
     if app.logger:
-        app.logger.log_action("plugin-remove", name, "")
+        app.logger.log_action("plugin-remove", safe_name, "")

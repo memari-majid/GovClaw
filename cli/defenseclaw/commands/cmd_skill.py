@@ -716,6 +716,14 @@ def _scan_from_http(app: AppContext, url: str, as_json: bool) -> None:
                 click.echo(f"[scan] tarfile: extractall done -> listing={os.listdir(extract_dir)!r}")
         elif zipfile.is_zipfile(download_path):
             with zipfile.ZipFile(download_path) as zf:
+                safe_root = os.path.realpath(extract_dir)
+                for member in zf.infolist():
+                    member_path = os.path.realpath(
+                        os.path.join(extract_dir, member.filename),
+                    )
+                    if not member_path.startswith(safe_root + os.sep) and member_path != safe_root:
+                        click.echo(f"error: zip contains path-traversal entry: {member.filename}", err=True)
+                        raise SystemExit(1)
                 zf.extractall(extract_dir)
         else:
             click.echo("error: unsupported archive format (expected .tar.gz or .zip)", err=True)

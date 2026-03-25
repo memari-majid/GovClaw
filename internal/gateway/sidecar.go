@@ -2,15 +2,18 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/defenseclaw/defenseclaw/internal/audit"
 	"github.com/defenseclaw/defenseclaw/internal/config"
 	"github.com/defenseclaw/defenseclaw/internal/policy"
 	"github.com/defenseclaw/defenseclaw/internal/sandbox"
+	"github.com/defenseclaw/defenseclaw/internal/telemetry"
 	"github.com/defenseclaw/defenseclaw/internal/watcher"
 )
 
@@ -24,10 +27,11 @@ type Sidecar struct {
 	logger *audit.Logger
 	health *SidecarHealth
 	shell  *sandbox.OpenShell
+	otel   *telemetry.Provider
 }
 
 // NewSidecar creates a sidecar instance ready to connect.
-func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, shell *sandbox.OpenShell) (*Sidecar, error) {
+func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, shell *sandbox.OpenShell, otel *telemetry.Provider) (*Sidecar, error) {
 	fmt.Fprintf(os.Stderr, "[sidecar] initializing client (host=%s port=%d device_key=%s)\n",
 		cfg.Gateway.Host, cfg.Gateway.Port, cfg.Gateway.DeviceKeyFile)
 
@@ -37,7 +41,7 @@ func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, sh
 	}
 	fmt.Fprintf(os.Stderr, "[sidecar] device identity loaded (id=%s)\n", client.device.DeviceID)
 
-	router := NewEventRouter(client, store, logger, cfg.Gateway.AutoApprove)
+	router := NewEventRouter(client, store, logger, cfg.Gateway.AutoApprove, otel)
 	client.OnEvent = router.Route
 
 	return &Sidecar{
@@ -48,6 +52,7 @@ func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, sh
 		logger: logger,
 		health: NewSidecarHealth(),
 		shell:  shell,
+		otel:   otel,
 	}, nil
 }
 
@@ -144,6 +149,8 @@ func (s *Sidecar) runGatewayLoop(ctx context.Context) error {
 		s.health.SetGateway(StateRunning, "", map[string]interface{}{
 			"protocol": hello.Protocol,
 		})
+
+		s.subscribeToSessions(ctx)
 
 		fmt.Fprintf(os.Stderr, "[sidecar] event loop running, waiting for events ...\n")
 
@@ -277,7 +284,7 @@ func (s *Sidecar) handleAdmissionResult(r watcher.AdmissionResult) {
 
 // runGuardrail starts the LiteLLM proxy child process when guardrail is enabled.
 func (s *Sidecar) runGuardrail(ctx context.Context) error {
-	llm := NewLiteLLMProcess(&s.cfg.Guardrail, s.logger, s.health)
+	llm := NewLiteLLMProcess(&s.cfg.Guardrail, s.logger, s.health, s.cfg.Gateway.APIPort)
 	return llm.Run(ctx)
 }
 
@@ -285,7 +292,42 @@ func (s *Sidecar) runGuardrail(ctx context.Context) error {
 func (s *Sidecar) runAPI(ctx context.Context) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.cfg.Gateway.APIPort)
 	api := NewAPIServer(addr, s.health, s.client, s.store, s.logger, s.cfg)
+	api.SetOTelProvider(s.otel)
 	return api.Run(ctx)
+}
+
+// subscribeToSessions lists active sessions and subscribes to each one
+// so we receive session.tool events for tool call/result tracing.
+func (s *Sidecar) subscribeToSessions(ctx context.Context) {
+	subCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	raw, err := s.client.SessionsList(subCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sidecar] sessions.list failed (will still receive agent events): %v\n", err)
+		return
+	}
+
+	var sessions []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &sessions); err != nil {
+		fmt.Fprintf(os.Stderr, "[sidecar] parse sessions list: %v\n", err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "[sidecar] found %d active sessions, subscribing for tool events...\n", len(sessions))
+
+	for _, sess := range sessions {
+		subCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+		if err := s.client.SessionsSubscribe(subCtx2, sess.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "[sidecar] subscribe to session %s failed: %v\n", sess.ID, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[sidecar] subscribed to session %s (%s)\n", sess.ID, sess.Name)
+		}
+		cancel2()
+	}
 }
 
 func (s *Sidecar) logHello(h *HelloOK) {

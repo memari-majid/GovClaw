@@ -28,7 +28,7 @@ class AIBOMScannerWrapper:
             tmp_path = tmp.name
 
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [self.binary, "analyze", target,
                  "--output-format", "json", "--output-file", tmp_path],
                 capture_output=True, text=True, timeout=300,
@@ -40,6 +40,22 @@ class AIBOMScannerWrapper:
                 file=sys.stderr,
             )
             raise SystemExit(1)
+
+        if proc.returncode != 0:
+            stderr_msg = proc.stderr.strip()[:200] if proc.stderr else "unknown error"
+            Path(tmp_path).unlink(missing_ok=True)
+            return ScanResult(
+                scanner="aibom",
+                target=target,
+                timestamp=datetime.now(timezone.utc),
+                findings=[Finding(
+                    id="scanner-error",
+                    severity="ERROR",
+                    title=f"AIBOM scanner exited with code {proc.returncode}",
+                    description=stderr_msg,
+                    scanner="aibom",
+                )],
+            )
 
         findings: list[Finding] = []
         try:

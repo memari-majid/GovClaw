@@ -23,46 +23,59 @@ def init_cmd(app: AppContext, skip_install: bool) -> None:
     Creates ~/.defenseclaw/, default config, SQLite database,
     and installs scanner dependencies.
     """
-    from defenseclaw.config import config_path, default_config, detect_environment
+    from defenseclaw.config import config_path, default_config, detect_environment, load
     from defenseclaw.db import Store
     from defenseclaw.logger import Logger
 
     env = detect_environment()
     click.echo(f"  Environment: {env}")
 
-    defaults = default_config()
-    click.echo(f"  Claw mode:   {defaults.claw.mode}")
-    click.echo(f"  Claw home:   {defaults.claw_home_dir()}")
+    cfg_file = config_path()
+    if os.path.exists(cfg_file):
+        cfg = load()
+        click.echo("  Config: preserved existing")
+    else:
+        cfg = default_config()
+        click.echo("  Config: created new defaults")
+
+    cfg.environment = env
+    click.echo(f"  Claw mode:   {cfg.claw.mode}")
+    click.echo(f"  Claw home:   {cfg.claw_home_dir()}")
 
     dirs = [
-        defaults.data_dir, defaults.quarantine_dir,
-        defaults.plugin_dir, defaults.policy_dir,
+        cfg.data_dir, cfg.quarantine_dir,
+        cfg.plugin_dir, cfg.policy_dir,
     ]
-    dirs.extend(defaults.skill_dirs())
-    dirs.extend(defaults.mcp_dirs())
 
+    data_dir_real = os.path.realpath(cfg.data_dir)
     for d in dirs:
         os.makedirs(d, exist_ok=True)
+
+    external_dirs = list(cfg.skill_dirs()) + list(cfg.mcp_dirs())
+    for d in external_dirs:
+        d_real = os.path.realpath(d)
+        if d_real.startswith(data_dir_real + os.sep):
+            os.makedirs(d, exist_ok=True)
     click.echo("  Directories: created")
 
-    defaults.save()
-    click.echo(f"  Config: {config_path()}")
+    cfg.save()
+    click.echo(f"  Config: {cfg_file}")
 
-    store = Store(defaults.audit_db)
+    store = Store(cfg.audit_db)
     store.init()
-    click.echo(f"  Audit DB: {defaults.audit_db}")
+    click.echo(f"  Audit DB: {cfg.audit_db}")
 
     logger = Logger(store)
-    logger.log_action("init", defaults.data_dir, f"environment={env}")
+    logger.log_action("init", cfg.data_dir, f"environment={env}")
 
     click.echo()
-    _install_scanners(defaults, logger, skip_install)
+    _install_scanners(cfg, logger, skip_install)
 
     click.echo()
-    _install_guardrail(defaults, logger, skip_install)
+    _install_guardrail(cfg, logger, skip_install)
 
     click.echo()
-    if shutil.which(defaults.openshell.binary):
+    if shutil.which(cfg.openshell.binary):
         click.echo("  OpenShell: found")
     elif env == "macos":
         click.echo("  OpenShell: not available on macOS (sandbox enforcement will be skipped)")

@@ -113,7 +113,7 @@ export interface BlockEntry {
   target_type: string;
   target_name: string;
   reason: string;
-  created_at: string;
+  updated_at: string;
 }
 
 export interface AllowEntry {
@@ -121,7 +121,7 @@ export interface AllowEntry {
   target_type: string;
   target_name: string;
   reason: string;
-  created_at: string;
+  updated_at: string;
 }
 
 export interface DaemonStatus {

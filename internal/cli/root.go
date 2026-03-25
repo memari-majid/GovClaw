@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -8,16 +9,26 @@ import (
 
 	"github.com/defenseclaw/defenseclaw/internal/audit"
 	"github.com/defenseclaw/defenseclaw/internal/config"
+	"github.com/defenseclaw/defenseclaw/internal/telemetry"
 )
 
 var (
-	cfg        *config.Config
-	auditStore *audit.Store
-	auditLog   *audit.Logger
+	cfg          *config.Config
+	auditStore   *audit.Store
+	auditLog     *audit.Logger
+	otelProvider *telemetry.Provider
+	appVersion   string
 )
 
 func SetVersion(v string) {
+	appVersion = v
 	rootCmd.Version = v
+}
+
+func SetBuildInfo(commit, date string) {
+	rootCmd.SetVersionTemplate(
+		fmt.Sprintf("{{.Name}} version {{.Version}} (commit=%s, built=%s)\n", commit, date),
+	)
 }
 
 var rootCmd = &cobra.Command{
@@ -42,9 +53,15 @@ Run without arguments to start the sidecar daemon.`,
 
 		auditLog = audit.NewLogger(auditStore)
 		initSplunkForwarder()
+		initOTelProvider()
 		return nil
 	},
 	PersistentPostRun: func(_ *cobra.Command, _ []string) {
+		if otelProvider != nil {
+			if err := otelProvider.Shutdown(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: otel shutdown: %v\n", err)
+			}
+		}
 		if auditLog != nil {
 			auditLog.Close()
 		}
@@ -60,6 +77,21 @@ func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func initOTelProvider() {
+	if cfg == nil || !cfg.OTel.Enabled {
+		return
+	}
+
+	p, err := telemetry.NewProvider(context.Background(), cfg, appVersion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: otel init: %v\n", err)
+		return
+	}
+
+	otelProvider = p
+	auditLog.SetOTelProvider(p)
 }
 
 func initSplunkForwarder() {

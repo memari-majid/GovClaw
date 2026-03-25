@@ -25,9 +25,15 @@ class SkillCommandTestBase(unittest.TestCase):
     def setUp(self):
         self.app, self.tmp_dir, self.db_path = make_app_context()
         self.runner = CliRunner()
+        self._orig_columns = os.environ.get("COLUMNS")
+        os.environ["COLUMNS"] = "200"
 
     def tearDown(self):
         cleanup_app(self.app, self.db_path, self.tmp_dir)
+        if self._orig_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = self._orig_columns
 
     def invoke(self, args: list[str]):
         return self.runner.invoke(skill, args, obj=self.app, catch_exceptions=False)

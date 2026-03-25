@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,12 +31,31 @@ type receivedRequest struct {
 	Params json.RawMessage
 }
 
+func newLocalTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprint(r)
+			if strings.Contains(msg, "failed to listen on a port") ||
+				strings.Contains(msg, "operation not permitted") {
+				t.Skipf("loopback listeners are unavailable in this environment: %s", msg)
+			}
+			panic(r)
+		}
+	}()
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // startMockGW creates an httptest server that simulates the gateway WebSocket.
 // It performs the v3 challenge-response handshake, then calls afterHandshake.
 func startMockGW(t *testing.T, afterHandshake func(t *testing.T, conn *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -68,7 +88,6 @@ func startMockGW(t *testing.T, afterHandshake func(t *testing.T, conn *websocket
 			afterHandshake(t, conn)
 		}
 	}))
-	t.Cleanup(srv.Close)
 	return srv
 }
 
@@ -171,7 +190,7 @@ func TestClientConnectSuccess(t *testing.T) {
 
 func TestClientConnectBadChallenge(t *testing.T) {
 	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -181,7 +200,6 @@ func TestClientConnectBadChallenge(t *testing.T) {
 		conn.WriteMessage(websocket.TextMessage, tick)
 		time.Sleep(2 * time.Second)
 	}))
-	t.Cleanup(srv.Close)
 
 	client := clientForServer(t, srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -198,7 +216,7 @@ func TestClientConnectBadChallenge(t *testing.T) {
 
 func TestClientConnectRejected(t *testing.T) {
 	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -223,7 +241,6 @@ func TestClientConnectRejected(t *testing.T) {
 		conn.WriteMessage(websocket.TextMessage, resp)
 		time.Sleep(time.Second)
 	}))
-	t.Cleanup(srv.Close)
 
 	client := clientForServer(t, srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -523,7 +540,7 @@ func TestRouteApprovalDangerousCommand(t *testing.T) {
 	client := connectToMockGW(t, srv)
 	store, logger := testStoreAndLogger(t)
 
-	r := NewEventRouter(client, store, logger, false)
+	r := NewEventRouter(client, store, logger, false, nil)
 
 	payload, _ := json.Marshal(ApprovalRequestPayload{
 		ID: "approval-1",
@@ -560,7 +577,7 @@ func TestRouteApprovalAutoApprove(t *testing.T) {
 	client := connectToMockGW(t, srv)
 	store, logger := testStoreAndLogger(t)
 
-	r := NewEventRouter(client, store, logger, true)
+	r := NewEventRouter(client, store, logger, true, nil)
 
 	payload, _ := json.Marshal(ApprovalRequestPayload{
 		ID: "approval-2",
@@ -594,7 +611,7 @@ func TestRouteApprovalNoAutoApprove(t *testing.T) {
 	client := connectToMockGW(t, srv)
 	store, logger := testStoreAndLogger(t)
 
-	r := NewEventRouter(client, store, logger, false)
+	r := NewEventRouter(client, store, logger, false, nil)
 
 	payload, _ := json.Marshal(ApprovalRequestPayload{
 		ID: "approval-3",
@@ -622,7 +639,7 @@ func TestRouteApprovalNoPlan(t *testing.T) {
 	client := connectToMockGW(t, srv)
 	store, logger := testStoreAndLogger(t)
 
-	r := NewEventRouter(client, store, logger, true)
+	r := NewEventRouter(client, store, logger, true, nil)
 
 	payload, _ := json.Marshal(ApprovalRequestPayload{ID: "approval-4"})
 

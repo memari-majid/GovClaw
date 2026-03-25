@@ -87,7 +87,7 @@ func runSidecar(_ *cobra.Command, _ []string) error {
 	}
 	fmt.Println()
 
-	sc, err := gateway.NewSidecar(cfg, auditStore, auditLog, shell)
+	sc, err := gateway.NewSidecar(cfg, auditStore, auditLog, shell, otelProvider)
 	if err != nil {
 		return fmt.Errorf("sidecar: init: %w", err)
 	}

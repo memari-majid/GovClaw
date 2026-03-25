@@ -108,6 +108,51 @@ class TestPluginRemove(PluginCommandTestBase):
         self.assertEqual(len(actions), 1)
 
 
+class TestPluginRemovePathTraversal(PluginCommandTestBase):
+    """Regression tests for path-traversal in plugin remove (P1 fix)."""
+
+    def test_remove_rejects_parent_traversal(self):
+        """../../etc -> basename 'etc' -> resolves safely inside plugin_dir -> not found."""
+        result = self.invoke(["remove", "../../etc"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("not found", result.output)
+
+    def test_remove_rejects_dotdot(self):
+        result = self.invoke(["remove", ".."])
+        self.assertEqual(result.exit_code, 1)
+
+    def test_remove_rejects_dot(self):
+        result = self.invoke(["remove", "."])
+        self.assertEqual(result.exit_code, 1)
+
+    def test_remove_rejects_absolute_path_component(self):
+        result = self.invoke(["remove", "/tmp/evil"])
+        # os.path.basename("/tmp/evil") == "evil" which is fine as a name,
+        # but it should just say "not found" since it doesn't exist
+        self.assertIn("not found", result.output)
+
+    def test_remove_rejects_slash_only(self):
+        result = self.invoke(["remove", "/"])
+        self.assertEqual(result.exit_code, 1)
+
+    def test_remove_strips_path_to_basename(self):
+        """Traversal like 'subdir/../other' should be reduced to basename 'other'."""
+        result = self.invoke(["remove", "subdir/../other"])
+        # basename("subdir/../other") == "other", which just won't exist
+        self.assertIn("not found", result.output)
+
+    def test_remove_does_not_delete_outside_plugin_dir(self):
+        """Create a dir outside plugin_dir and verify it survives a traversal attempt."""
+        outside_dir = os.path.join(self.tmp_dir, "precious-data")
+        os.makedirs(outside_dir)
+        sentinel = os.path.join(outside_dir, "keep.txt")
+        with open(sentinel, "w") as f:
+            f.write("do not delete")
+
+        self.invoke(["remove", "../precious-data"])
+        self.assertTrue(os.path.isfile(sentinel), "file outside plugin_dir must survive")
+
+
 class TestPluginLifecycle(PluginCommandTestBase):
     def test_install_list_remove_list(self):
         src = self._create_plugin_dir("lifecycle")

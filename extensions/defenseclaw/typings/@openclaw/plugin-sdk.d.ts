@@ -1,6 +1,17 @@
 declare module "@openclaw/plugin-sdk" {
+  interface AdmissionDecision {
+    allow: boolean;
+    reason?: string;
+  }
+
   interface PluginApi {
     on(event: string, handler: (...args: any[]) => void | Promise<void>): void;
+    guard(
+      event: string,
+      handler: (
+        ...args: any[]
+      ) => AdmissionDecision | Promise<AdmissionDecision>,
+    ): void;
   }
 
   interface CommandArg {

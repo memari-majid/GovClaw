@@ -38,6 +38,51 @@ type Config struct {
 	Splunk        SplunkConfig       `mapstructure:"splunk"         yaml:"splunk"`
 	Gateway       GatewayConfig      `mapstructure:"gateway"        yaml:"gateway"`
 	SkillActions  SkillActionsConfig `mapstructure:"skill_actions"  yaml:"skill_actions"`
+	OTel          OTelConfig         `mapstructure:"otel"           yaml:"otel"`
+}
+
+type OTelConfig struct {
+	Enabled  bool              `mapstructure:"enabled"  yaml:"enabled"`
+	Protocol string            `mapstructure:"protocol" yaml:"protocol"`
+	Endpoint string            `mapstructure:"endpoint" yaml:"endpoint"`
+	Headers  map[string]string `mapstructure:"headers"  yaml:"headers"`
+	TLS      OTelTLSConfig     `mapstructure:"tls"      yaml:"tls"`
+	Traces   OTelTracesConfig  `mapstructure:"traces"   yaml:"traces"`
+	Logs     OTelLogsConfig    `mapstructure:"logs"     yaml:"logs"`
+	Metrics  OTelMetricsConfig `mapstructure:"metrics"  yaml:"metrics"`
+	Batch    OTelBatchConfig   `mapstructure:"batch"    yaml:"batch"`
+	Resource OTelResourceConfig `mapstructure:"resource" yaml:"resource"`
+}
+
+type OTelTLSConfig struct {
+	Insecure bool   `mapstructure:"insecure" yaml:"insecure"`
+	CACert   string `mapstructure:"ca_cert"  yaml:"ca_cert"`
+}
+
+type OTelTracesConfig struct {
+	Enabled    bool   `mapstructure:"enabled"     yaml:"enabled"`
+	Sampler    string `mapstructure:"sampler"      yaml:"sampler"`
+	SamplerArg string `mapstructure:"sampler_arg"  yaml:"sampler_arg"`
+}
+
+type OTelLogsConfig struct {
+	Enabled                bool `mapstructure:"enabled"                  yaml:"enabled"`
+	EmitIndividualFindings bool `mapstructure:"emit_individual_findings" yaml:"emit_individual_findings"`
+}
+
+type OTelMetricsConfig struct {
+	Enabled         bool `mapstructure:"enabled"            yaml:"enabled"`
+	ExportIntervalS int  `mapstructure:"export_interval_s"  yaml:"export_interval_s"`
+}
+
+type OTelBatchConfig struct {
+	MaxExportBatchSize int `mapstructure:"max_export_batch_size" yaml:"max_export_batch_size"`
+	ScheduledDelayMs   int `mapstructure:"scheduled_delay_ms"    yaml:"scheduled_delay_ms"`
+	MaxQueueSize       int `mapstructure:"max_queue_size"         yaml:"max_queue_size"`
+}
+
+type OTelResourceConfig struct {
+	Attributes map[string]string `mapstructure:"attributes" yaml:"attributes"`
 }
 
 type FirewallConfig struct {
@@ -287,4 +332,20 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("gateway.watcher.skill.enabled", true)
 	viper.SetDefault("gateway.watcher.skill.take_action", true)
 	viper.SetDefault("gateway.watcher.skill.dirs", []string{})
+
+	viper.SetDefault("otel.enabled", false)
+	viper.SetDefault("otel.protocol", "grpc")
+	viper.SetDefault("otel.endpoint", "")
+	viper.SetDefault("otel.tls.insecure", false)
+	viper.SetDefault("otel.tls.ca_cert", "")
+	viper.SetDefault("otel.traces.enabled", true)
+	viper.SetDefault("otel.traces.sampler", "always_on")
+	viper.SetDefault("otel.traces.sampler_arg", "1.0")
+	viper.SetDefault("otel.logs.enabled", true)
+	viper.SetDefault("otel.logs.emit_individual_findings", false)
+	viper.SetDefault("otel.metrics.enabled", true)
+	viper.SetDefault("otel.metrics.export_interval_s", 60)
+	viper.SetDefault("otel.batch.max_export_batch_size", 512)
+	viper.SetDefault("otel.batch.scheduled_delay_ms", 5000)
+	viper.SetDefault("otel.batch.max_queue_size", 2048)
 }

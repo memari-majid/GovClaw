@@ -356,9 +356,10 @@ class TestMCPCommands(unittest.TestCase):
 # ── init ──────────────────────────────────────────────────────────────────
 
 class TestInitCommand(unittest.TestCase):
+    @patch("defenseclaw.commands.cmd_init._install_guardrail")
     @patch("shutil.which", return_value=None)
     @patch("defenseclaw.config.detect_environment", return_value="macos")
-    def test_init_skip_install(self, _env, _which):
+    def test_init_skip_install(self, _env, _which, _guardrail):
         from defenseclaw.commands.cmd_init import init_cmd
 
         with tempfile.TemporaryDirectory() as tmpdir:

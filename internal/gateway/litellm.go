@@ -21,13 +21,14 @@ import (
 // on crash. The guardrail Python module directory is added to PYTHONPATH so
 // LiteLLM can import it.
 type LiteLLMProcess struct {
-	cfg    *config.GuardrailConfig
-	logger *audit.Logger
-	health *SidecarHealth
+	cfg     *config.GuardrailConfig
+	logger  *audit.Logger
+	health  *SidecarHealth
+	apiPort int
 }
 
-func NewLiteLLMProcess(cfg *config.GuardrailConfig, logger *audit.Logger, health *SidecarHealth) *LiteLLMProcess {
-	return &LiteLLMProcess{cfg: cfg, logger: logger, health: health}
+func NewLiteLLMProcess(cfg *config.GuardrailConfig, logger *audit.Logger, health *SidecarHealth, apiPort int) *LiteLLMProcess {
+	return &LiteLLMProcess{cfg: cfg, logger: logger, health: health, apiPort: apiPort}
 }
 
 // Run starts the LiteLLM proxy and keeps it running until ctx is cancelled.
@@ -152,6 +153,9 @@ func (l *LiteLLMProcess) buildEnv() []string {
 	}
 	filtered = append(filtered, "PYTHONPATH="+pythonPath)
 	filtered = append(filtered, "DEFENSECLAW_GUARDRAIL_MODE="+l.cfg.Mode)
+	if l.apiPort > 0 {
+		filtered = append(filtered, fmt.Sprintf("DEFENSECLAW_API_PORT=%d", l.apiPort))
+	}
 
 	return filtered
 }

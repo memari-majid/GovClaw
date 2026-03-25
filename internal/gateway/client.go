@@ -23,6 +23,7 @@ import (
 type Client struct {
 	cfg    *config.GatewayConfig
 	device *DeviceIdentity
+	debug  bool
 
 	conn       *websocket.Conn
 	mu         sync.Mutex
@@ -48,6 +49,7 @@ func NewClient(cfg *config.GatewayConfig) (*Client, error) {
 	return &Client{
 		cfg:     cfg,
 		device:  device,
+		debug:   os.Getenv("DEFENSECLAW_DEBUG") == "1",
 		pending: make(map[string]chan *ResponseFrame),
 		lastSeq: -1,
 	}, nil
@@ -118,7 +120,9 @@ func (c *Client) waitForChallenge(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read challenge: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "[gateway] received frame (%d bytes): %s\n", len(raw), truncateBytes(raw, 300))
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[gateway] received frame (%d bytes): %s\n", len(raw), truncateBytes(raw, 300))
+	}
 
 	var frame RawFrame
 	if err := json.Unmarshal(raw, &frame); err != nil {
@@ -181,9 +185,11 @@ func (c *Client) sendConnect(ctx context.Context, nonce string) (*HelloOK, error
 		"locale":    "en-US",
 	}
 
-	if debugData, err := json.MarshalIndent(params, "  ", "  "); err == nil {
-		redacted := redactToken(string(debugData), c.cfg.Token)
-		fmt.Fprintf(os.Stderr, "[gateway] connect params:\n  %s\n", redacted)
+	if c.debug {
+		if debugData, err := json.MarshalIndent(params, "  ", "  "); err == nil {
+			redacted := redactToken(string(debugData), c.cfg.Token)
+			fmt.Fprintf(os.Stderr, "[gateway] connect params:\n  %s\n", redacted)
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "[gateway] waiting for connect response ...\n")
@@ -192,8 +198,13 @@ func (c *Client) sendConnect(ctx context.Context, nonce string) (*HelloOK, error
 		return nil, err
 	}
 
-	fmt.Fprintf(os.Stderr, "[gateway] connect response: ok=%v payload=%s\n",
-		resp.OK, truncateBytes(resp.Payload, 500))
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[gateway] connect response: ok=%v payload=%s\n",
+			resp.OK, truncateBytes(resp.Payload, 500))
+	} else {
+		fmt.Fprintf(os.Stderr, "[gateway] connect response: ok=%v payload_len=%d\n",
+			resp.OK, len(resp.Payload))
+	}
 	if resp.Error != nil {
 		fmt.Fprintf(os.Stderr, "[gateway] connect error: code=%s message=%s\n",
 			resp.Error.Code, resp.Error.Message)
@@ -230,8 +241,7 @@ func (c *Client) readLoop() {
 
 		var frame RawFrame
 		if err := json.Unmarshal(raw, &frame); err != nil {
-			fmt.Fprintf(os.Stderr, "[gateway] unparseable frame (%d bytes): %s\n",
-				len(raw), truncateBytes(raw, 200))
+			fmt.Fprintf(os.Stderr, "[gateway] unparseable frame (%d bytes)\n", len(raw))
 			continue
 		}
 
@@ -266,8 +276,13 @@ func (c *Client) readLoop() {
 			if evt.Seq != nil {
 				seqStr = fmt.Sprintf("%d", *evt.Seq)
 			}
-			fmt.Fprintf(os.Stderr, "[gateway] ← event %s seq=%s payload=%s\n",
-				evt.Event, seqStr, truncateBytes(evt.Payload, 200))
+			if c.debug {
+				fmt.Fprintf(os.Stderr, "[gateway] ← event %s seq=%s payload=%s\n",
+					evt.Event, seqStr, truncateBytes(evt.Payload, 200))
+			} else {
+				fmt.Fprintf(os.Stderr, "[gateway] ← event %s seq=%s payload_len=%d\n",
+					evt.Event, seqStr, len(evt.Payload))
+			}
 			if evt.Seq != nil {
 				seq := *evt.Seq
 				if c.lastSeq >= 0 && seq > c.lastSeq+1 {
@@ -280,8 +295,8 @@ func (c *Client) readLoop() {
 			}
 
 		default:
-			fmt.Fprintf(os.Stderr, "[gateway] ← unknown frame type=%s (%d bytes): %s\n",
-				frame.Type, len(raw), truncateBytes(raw, 200))
+			fmt.Fprintf(os.Stderr, "[gateway] ← unknown frame type=%s (%d bytes)\n",
+				frame.Type, len(raw))
 		}
 	}
 }
