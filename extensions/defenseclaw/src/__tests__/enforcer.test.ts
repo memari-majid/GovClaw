@@ -14,7 +14,7 @@ let blockedList: Array<{
   target_type: string;
   target_name: string;
   reason: string;
-  created_at: string;
+  updated_at: string;
 }> = [];
 let allowedList: typeof blockedList = [];
 
@@ -43,7 +43,7 @@ class MockDaemonClient {
       target_type: targetType,
       target_name: targetName,
       reason,
-      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     });
     allowedList = allowedList.filter(
       (entry) =>
@@ -69,7 +69,7 @@ class MockDaemonClient {
       target_type: targetType,
       target_name: targetName,
       reason,
-      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     });
     blockedList = blockedList.filter(
       (entry) =>
@@ -147,7 +147,7 @@ class MockDaemonClient {
     } else if (isAllowed) {
       verdict = "allowed";
       reason = "allow-listed";
-    } else if ((scanResult?.total_findings ?? 0) === 0) {
+    } else if (scanResult && scanResult.total_findings === 0) {
       verdict = "clean";
       reason = "scan clean";
     } else if (
@@ -233,7 +233,7 @@ describe("PolicyEnforcer", () => {
           target_type: "skill",
           target_name: "blocked-skill",
           reason: "daemon blocked",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
       allowedList = [
@@ -242,7 +242,7 @@ describe("PolicyEnforcer", () => {
           target_type: "mcp",
           target_name: "allowed-mcp",
           reason: "daemon allowed",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
 
@@ -274,7 +274,7 @@ describe("PolicyEnforcer", () => {
           target_type: "plugin",
           target_name: "daemon-blocked",
           reason: "blocked by admin",
-          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       ];
 

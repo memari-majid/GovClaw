@@ -225,7 +225,7 @@ type enforcementEntry struct {
 	TargetType string    `json:"target_type"`
 	TargetName string    `json:"target_name"`
 	Reason     string    `json:"reason"`
-	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type policyEvaluateRequest struct {
@@ -881,7 +881,7 @@ func toEnforcementEntries(entries []audit.ActionEntry) []enforcementEntry {
 			TargetType: entry.TargetType,
 			TargetName: entry.TargetName,
 			Reason:     entry.Reason,
-			CreatedAt:  entry.UpdatedAt,
+			UpdatedAt:  entry.UpdatedAt,
 		})
 	}
 	return out
