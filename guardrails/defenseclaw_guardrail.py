@@ -314,6 +314,7 @@ class DefenseClawGuardrail(CustomGuardrail):
     def __init__(self, **kwargs: Any) -> None:
         self.mode: str = os.getenv("DEFENSECLAW_GUARDRAIL_MODE", "observe")
         self.scanner_mode: str = os.getenv("DEFENSECLAW_SCANNER_MODE", "local")
+        self.block_message: str = ""
         self._cisco_client: CiscoAIDefenseClient | None = None
         if self.scanner_mode in ("remote", "both"):
             self._cisco_client = CiscoAIDefenseClient()
@@ -379,6 +380,8 @@ class DefenseClawGuardrail(CustomGuardrail):
                     self._cisco_client = CiscoAIDefenseClient()
                 elif new_sm == "local":
                     self._cisco_client = None
+        if "block_message" in runtime:
+            self.block_message = runtime["block_message"]
 
         local_result: dict[str, Any] | None = None
         cisco_result: dict[str, Any] | None = None
@@ -792,8 +795,9 @@ class DefenseClawGuardrail(CustomGuardrail):
     # Blocking helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _block_message(direction: str, reason: str) -> str:
+    def _block_message(self, direction: str, reason: str) -> str:
+        if self.block_message:
+            return self.block_message
         if direction == "prompt":
             return (
                 "I'm unable to process this request. DefenseClaw detected a "
@@ -808,14 +812,13 @@ class DefenseClawGuardrail(CustomGuardrail):
             "administrator or adjust the guardrail policy."
         )
 
-    @staticmethod
-    def _replace_response(response: Any, reason: str) -> None:
+    def _replace_response(self, response: Any, reason: str) -> None:
         """Mutate a ModelResponse in-place to replace content with a block notice."""
         import litellm
 
         if not isinstance(response, litellm.ModelResponse):
             return
-        msg = (
+        msg = self.block_message or (
             "The model's response was blocked by DefenseClaw due to a "
             f"potential security concern ({reason}). "
             "If you believe this is a false positive, contact your "

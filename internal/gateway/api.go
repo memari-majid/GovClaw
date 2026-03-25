@@ -983,8 +983,9 @@ func (a *APIServer) writeGuardrailRuntime() error {
 	}
 	runtimeFile := filepath.Join(a.scannerCfg.DataDir, "guardrail_runtime.json")
 	data, err := json.Marshal(map[string]string{
-		"mode":         a.scannerCfg.Guardrail.Mode,
-		"scanner_mode": a.scannerCfg.Guardrail.ScannerMode,
+		"mode":          a.scannerCfg.Guardrail.Mode,
+		"scanner_mode":  a.scannerCfg.Guardrail.ScannerMode,
+		"block_message": a.scannerCfg.Guardrail.BlockMessage,
 	})
 	if err != nil {
 		return fmt.Errorf("api: marshal runtime config: %w", err)

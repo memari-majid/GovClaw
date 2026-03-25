@@ -213,6 +213,7 @@ class GuardrailConfig:
     guardrail_dir: str = ""         # directory containing guardrail module (must match litellm_config dir)
     litellm_config: str = ""        # path to generated litellm_config.yaml
     original_model: str = ""        # original OpenClaw model (for revert)
+    block_message: str = ""          # custom message shown when a request is blocked (empty = default)
     cisco_ai_defense: CiscoAIDefenseConfig = field(default_factory=CiscoAIDefenseConfig)
 
 
@@ -351,6 +352,7 @@ def _merge_guardrail(raw: dict[str, Any] | None, data_dir: str) -> GuardrailConf
         guardrail_dir=raw.get("guardrail_dir", data_dir),
         litellm_config=raw.get("litellm_config", os.path.join(data_dir, "litellm_config.yaml")),
         original_model=raw.get("original_model", ""),
+        block_message=raw.get("block_message", ""),
         cisco_ai_defense=_merge_cisco_ai_defense(raw.get("cisco_ai_defense")),
     )
 

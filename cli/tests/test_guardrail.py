@@ -51,6 +51,7 @@ class TestGuardrailConfig(unittest.TestCase):
         self.assertEqual(gc.port, 4000)
         self.assertEqual(gc.model, "")
         self.assertEqual(gc.api_key_env, "")
+        self.assertEqual(gc.block_message, "")
 
     def test_default_config_includes_guardrail(self):
         cfg = default_config()
@@ -75,6 +76,7 @@ class TestGuardrailConfig(unittest.TestCase):
                     model="anthropic/claude-opus-4-5",
                     model_name="claude-opus",
                     api_key_env="ANTHROPIC_API_KEY",
+                    block_message="Blocked by policy. Contact security@acme.com.",
                     guardrail_dir=tmpdir,
                     litellm_config=os.path.join(tmpdir, "litellm_config.yaml"),
                 ),
@@ -92,6 +94,7 @@ class TestGuardrailConfig(unittest.TestCase):
             self.assertEqual(g["model"], "anthropic/claude-opus-4-5")
             self.assertEqual(g["model_name"], "claude-opus")
             self.assertEqual(g["api_key_env"], "ANTHROPIC_API_KEY")
+            self.assertEqual(g["block_message"], "Blocked by policy. Contact security@acme.com.")
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1127,81 @@ class TestSetupGuardrailCommand(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("defenseclaw setup guardrail --disable", result.output)
 
+    def test_block_message_non_interactive(self):
+        from defenseclaw.commands.cmd_setup import setup
+        self.app.cfg.guardrail.model = "anthropic/claude-opus-4-5"
+        self.app.cfg.guardrail.model_name = "claude-opus"
+        self.app.cfg.guardrail.api_key_env = "ANTHROPIC_API_KEY"
+        self.app.cfg.guardrail.guardrail_dir = self.tmp_dir
+        self.app.cfg.guardrail.litellm_config = os.path.join(self.tmp_dir, "litellm_config.yaml")
+        self.app.cfg.claw.home_dir = self.tmp_dir
+        custom_msg = "Blocked by policy. Contact security@acme.com."
+        result = self.runner.invoke(
+            setup,
+            ["guardrail", "--non-interactive", "--mode", "action",
+             "--block-message", custom_msg],
+            obj=self.app,
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("block_message", result.output)
+        self.assertIn("Blocked by policy", result.output)
+
+        import yaml
+        with open(os.path.join(self.tmp_dir, "config.yaml")) as f:
+            raw = yaml.safe_load(f)
+        self.assertEqual(raw["guardrail"]["block_message"], custom_msg)
+
+    def test_block_message_written_to_runtime_json(self):
+        from defenseclaw.commands.cmd_setup import setup
+        self.app.cfg.guardrail.model = "anthropic/claude-opus-4-5"
+        self.app.cfg.guardrail.model_name = "claude-opus"
+        self.app.cfg.guardrail.api_key_env = "ANTHROPIC_API_KEY"
+        self.app.cfg.guardrail.guardrail_dir = self.tmp_dir
+        self.app.cfg.guardrail.litellm_config = os.path.join(self.tmp_dir, "litellm_config.yaml")
+        self.app.cfg.claw.home_dir = self.tmp_dir
+        custom_msg = "Custom block message for testing."
+        result = self.runner.invoke(
+            setup,
+            ["guardrail", "--non-interactive", "--mode", "action",
+             "--block-message", custom_msg],
+            obj=self.app,
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        runtime_file = os.path.join(self.tmp_dir, "guardrail_runtime.json")
+        self.assertTrue(os.path.isfile(runtime_file))
+        with open(runtime_file) as f:
+            runtime = json.load(f)
+        self.assertEqual(runtime["block_message"], custom_msg)
+        self.assertEqual(runtime["mode"], "action")
+
+    def test_block_message_empty_by_default_in_runtime_json(self):
+        from defenseclaw.commands.cmd_setup import setup
+        self.app.cfg.guardrail.model = "anthropic/claude-opus-4-5"
+        self.app.cfg.guardrail.model_name = "claude-opus"
+        self.app.cfg.guardrail.api_key_env = "ANTHROPIC_API_KEY"
+        self.app.cfg.guardrail.guardrail_dir = self.tmp_dir
+        self.app.cfg.guardrail.litellm_config = os.path.join(self.tmp_dir, "litellm_config.yaml")
+        self.app.cfg.claw.home_dir = self.tmp_dir
+        result = self.runner.invoke(
+            setup,
+            ["guardrail", "--non-interactive", "--mode", "observe"],
+            obj=self.app,
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+
+        runtime_file = os.path.join(self.tmp_dir, "guardrail_runtime.json")
+        self.assertTrue(os.path.isfile(runtime_file))
+        with open(runtime_file) as f:
+            runtime = json.load(f)
+        self.assertEqual(runtime["block_message"], "")
+
+    def test_help_shows_block_message_option(self):
+        from defenseclaw.commands.cmd_setup import setup
+        result = self.runner.invoke(setup, ["guardrail", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("--block-message", result.output)
+
 
 # ---------------------------------------------------------------------------
 # Service restart helpers
@@ -1154,6 +1232,22 @@ class TestIsPidAlive(unittest.TestCase):
         from defenseclaw.commands.cmd_setup import _is_pid_alive
         with tempfile.NamedTemporaryFile(mode="w", suffix=".pid", delete=False) as f:
             f.write("not-a-number")
+            f.flush()
+            self.assertFalse(_is_pid_alive(f.name))
+        os.unlink(f.name)
+
+    def test_json_pid_own_process(self):
+        from defenseclaw.commands.cmd_setup import _is_pid_alive
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pid", delete=False) as f:
+            json.dump({"pid": os.getpid(), "executable": "/usr/bin/test", "start_time": 0}, f)
+            f.flush()
+            self.assertTrue(_is_pid_alive(f.name))
+        os.unlink(f.name)
+
+    def test_json_pid_stale_process(self):
+        from defenseclaw.commands.cmd_setup import _is_pid_alive
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pid", delete=False) as f:
+            json.dump({"pid": 999999999, "executable": "/usr/bin/test", "start_time": 0}, f)
             f.flush()
             self.assertFalse(_is_pid_alive(f.name))
         os.unlink(f.name)
@@ -1731,6 +1825,15 @@ class TestMergeVerdicts(unittest.TestCase):
 class TestGuardrailScannerMode(unittest.TestCase):
     """Test the multi-scanner orchestrator based on scanner_mode."""
 
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["DEFENSECLAW_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("DEFENSECLAW_DATA_DIR", None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
     def _make_guardrail(self, scanner_mode="local"):
         guardrails_dir = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..", "guardrails")
@@ -1746,6 +1849,7 @@ class TestGuardrailScannerMode(unittest.TestCase):
         g = DefenseClawGuardrail.__new__(DefenseClawGuardrail)
         g.mode = "action"
         g.scanner_mode = scanner_mode
+        g.block_message = ""
         g._cisco_client = None
         return g
 
@@ -1850,6 +1954,7 @@ class TestEvaluateViaSidecar(unittest.TestCase):
         g = DefenseClawGuardrail.__new__(DefenseClawGuardrail)
         g.mode = "action"
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
         return g
 
@@ -1922,6 +2027,7 @@ class TestHotReload(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = "observe"
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
 
         with patch.dict(os.environ, {}, clear=False):
@@ -1941,6 +2047,7 @@ class TestHotReload(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = "observe"
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
 
         with patch.dict(os.environ, {}, clear=False):
@@ -1999,8 +2106,18 @@ class TestE2EGuardrailPipeline(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = mode
         g.scanner_mode = scanner_mode
+        g.block_message = ""
         g._cisco_client = None
         return g
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["DEFENSECLAW_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("DEFENSECLAW_DATA_DIR", None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     @patch.dict(os.environ, {}, clear=False)
     def test_clean_prompt_allowed(self):
@@ -2240,15 +2357,25 @@ class TestAsyncPreCallHook(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = mode
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
         return g
 
     def setUp(self):
         self.mod = self._get_modules()
         self.mod._verdict_cache.clear()
+        self.mod._runtime_cache = {}
+        self.mod._runtime_cache_ts = 0.0
+        self._tmp = tempfile.mkdtemp()
+        os.environ["DEFENSECLAW_DATA_DIR"] = self._tmp
 
     def tearDown(self):
         self.mod._verdict_cache.clear()
+        self.mod._runtime_cache = {}
+        self.mod._runtime_cache_ts = 0.0
+        os.environ.pop("DEFENSECLAW_DATA_DIR", None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     @patch.dict(os.environ, {}, clear=False)
     def test_clean_prompt_returns_data_without_mock(self):
@@ -2348,15 +2475,25 @@ class TestAsyncModerationHook(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = mode
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
         return g
 
     def setUp(self):
         self.mod = self._get_modules()
         self.mod._verdict_cache.clear()
+        self.mod._runtime_cache = {}
+        self.mod._runtime_cache_ts = 0.0
+        self._tmp = tempfile.mkdtemp()
+        os.environ["DEFENSECLAW_DATA_DIR"] = self._tmp
 
     def tearDown(self):
         self.mod._verdict_cache.clear()
+        self.mod._runtime_cache = {}
+        self.mod._runtime_cache_ts = 0.0
+        os.environ.pop("DEFENSECLAW_DATA_DIR", None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     @patch.dict(os.environ, {}, clear=False)
     def test_skips_when_mock_response_already_set(self):
@@ -2491,6 +2628,15 @@ class TestFalsePositivePrevention(unittest.TestCase):
             sys.path.pop(0)
         return mod
 
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["DEFENSECLAW_DATA_DIR"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("DEFENSECLAW_DATA_DIR", None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
     @patch.dict(os.environ, {}, clear=False)
     def test_clean_prompt_after_malicious_history(self):
         """A clean 'hello' must NOT be blocked just because the history has malicious input."""
@@ -2499,6 +2645,7 @@ class TestFalsePositivePrevention(unittest.TestCase):
         g = mod.DefenseClawGuardrail.__new__(mod.DefenseClawGuardrail)
         g.mode = "action"
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
 
         data = {
@@ -2521,7 +2668,7 @@ class TestFalsePositivePrevention(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestBlockMessage(unittest.TestCase):
-    def _get_cls(self):
+    def _make_guardrail(self, block_message=""):
         guardrails_dir = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..", "guardrails")
         )
@@ -2532,20 +2679,37 @@ class TestBlockMessage(unittest.TestCase):
             self.skipTest("litellm not installed")
         finally:
             sys.path.pop(0)
-        return DefenseClawGuardrail
+        g = DefenseClawGuardrail.__new__(DefenseClawGuardrail)
+        g.mode = "action"
+        g.scanner_mode = "local"
+        g.block_message = block_message
+        g._cisco_client = None
+        return g
 
     def test_prompt_direction_message(self):
-        cls = self._get_cls()
-        msg = cls._block_message("prompt", "injection detected")
+        g = self._make_guardrail()
+        msg = g._block_message("prompt", "injection detected")
         self.assertIn("prompt", msg)
         self.assertIn("injection detected", msg)
         self.assertIn("DefenseClaw", msg)
 
     def test_completion_direction_message(self):
-        cls = self._get_cls()
-        msg = cls._block_message("completion", "secret leak")
+        g = self._make_guardrail()
+        msg = g._block_message("completion", "secret leak")
         self.assertIn("response was blocked", msg)
         self.assertIn("secret leak", msg)
+
+    def test_custom_block_message_overrides_default(self):
+        custom = "Blocked by corporate policy."
+        g = self._make_guardrail(block_message=custom)
+        msg = g._block_message("prompt", "injection detected")
+        self.assertEqual(msg, custom)
+
+    def test_custom_block_message_overrides_completion(self):
+        custom = "Access denied by DefenseClaw."
+        g = self._make_guardrail(block_message=custom)
+        msg = g._block_message("completion", "secret leak")
+        self.assertEqual(msg, custom)
 
 
 class TestExtractContent(unittest.TestCase):
@@ -2605,6 +2769,7 @@ class TestScanLocal(unittest.TestCase):
         g = DefenseClawGuardrail.__new__(DefenseClawGuardrail)
         g.mode = "action"
         g.scanner_mode = "local"
+        g.block_message = ""
         g._cisco_client = None
         return g
 

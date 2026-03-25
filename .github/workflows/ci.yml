@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - run: make go-test-cov
       - uses: actions/upload-artifact@v4
         with:
           name: go-coverage
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o defenseclaw-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/defenseclaw
+      - run: make gateway-cross GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
       - uses: actions/upload-artifact@v4
         with:
           name: defenseclaw-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -65,8 +65,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv sync
-      - run: uv run ruff check cli/defenseclaw/
-      - run: uv run pytest cli/tests/ -v --tb=short --cov=defenseclaw --cov-report=xml:coverage-py.xml
+      - run: make py-lint
+      - run: make cli-test-cov
       - uses: actions/upload-artifact@v4
         with:
           name: python-coverage
@@ -88,9 +88,6 @@ jobs:
   ts-build-test:
     name: TypeScript Build & Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: extensions/defenseclaw
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,9 +95,8 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: extensions/defenseclaw/package-lock.json
-      - run: npm ci
-      - run: npm run build
-      - run: npx vitest run
+      - run: make plugin
+      - run: make ts-test
 
   ts-audit:
     name: npm Dependency Audit
@@ -126,7 +122,7 @@ jobs:
       - uses: open-policy-agent/setup-opa@v2
         with:
           version: latest
-      - run: opa test policies/rego/ -v
+      - run: make rego-test
 
   make-test:
     name: make test (unified)

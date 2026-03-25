@@ -10,12 +10,19 @@ Enterprise governance layer for OpenClaw. Wraps Cisco AI Defense scanners and NV
 | `make install` | Build and install all components |
 | `make pycli` | Build Python CLI into .venv |
 | `make gateway` | Build Go gateway binary |
+| `make gateway-cross GOOS=linux GOARCH=amd64` | Cross-compile gateway for target platform |
 | `make plugin` | Build the OpenClaw TypeScript plugin |
 | `make gateway-install` | Build + install gateway to ~/.local/bin |
 | `make plugin-install` | Build + install plugin to ~/.openclaw/extensions/ |
 | `make dev-install` | Full dev setup via install-dev.sh |
 | `make test` | Run all tests (Python + Go) |
-| `make lint` | Run linter |
+| `make cli-test-cov` | Run Python tests with coverage report |
+| `make go-test-cov` | Run Go tests with coverage report |
+| `make ts-test` | Run TypeScript plugin tests |
+| `make rego-test` | Run Rego policy tests |
+| `make lint` | Run Python linter (ruff + py_compile) |
+| `make py-lint` | Run ruff check on Python CLI |
+| `make go-lint` | Run golangci-lint on Go code |
 | `go run ./cmd/defenseclaw` | Run gateway from source |
 
 ## Tech Stack (locked)

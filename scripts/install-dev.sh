@@ -283,13 +283,22 @@ check_optional_deps() {
         log_warn "make not found — you can still build manually with 'go build'"
     fi
     
-    # Check for golangci-lint (for development)
+    # Check for golangci-lint
     if command_exists golangci-lint; then
         local lint_version
         lint_version="$(extract_version "$(golangci-lint --version 2>/dev/null)" || echo "unknown")"
         log_success "golangci-lint ${lint_version} found"
     else
-        log_info "golangci-lint not found (optional, for linting)"
+        log_info "golangci-lint not found — will install"
+    fi
+    
+    # Check for OPA
+    if command_exists opa; then
+        local opa_version
+        opa_version="$(extract_version "$(opa version 2>/dev/null)" || echo "unknown")"
+        log_success "opa ${opa_version} found"
+    else
+        log_info "opa not found — will install"
     fi
 }
 
@@ -425,6 +434,36 @@ install_go_gateway() {
         echo ""
         echo "    export PATH=\"${INSTALL_DIR}:\$PATH\""
         echo ""
+    fi
+}
+
+install_dev_tools() {
+    log_step "Installing Dev Tools"
+    
+    # golangci-lint
+    if command_exists golangci-lint; then
+        log_success "golangci-lint already installed"
+    else
+        log_info "Installing golangci-lint..."
+        go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.0
+        if command_exists golangci-lint; then
+            log_success "golangci-lint installed"
+        else
+            log_warn "golangci-lint installed to $(go env GOPATH)/bin — ensure it is in your PATH"
+        fi
+    fi
+    
+    # OPA
+    if command_exists opa; then
+        log_success "opa already installed"
+    else
+        log_info "Installing opa..."
+        go install github.com/open-policy-agent/opa@latest
+        if command_exists opa; then
+            log_success "opa installed"
+        else
+            log_warn "opa installed to $(go env GOPATH)/bin — ensure it is in your PATH"
+        fi
     fi
 }
 
@@ -574,6 +613,7 @@ main() {
     # Install
     setup_python_venv
     install_python_cli
+    install_dev_tools
     build_go_gateway
     
     if [[ "${skip_install}" == false ]]; then

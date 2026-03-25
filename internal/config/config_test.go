@@ -80,6 +80,9 @@ func TestDefaultConfigGuardrail(t *testing.T) {
 	if cfg.Guardrail.LiteLLMConfig == "" {
 		t.Error("litellm_config should not be empty")
 	}
+	if cfg.Guardrail.BlockMessage != "" {
+		t.Errorf("expected empty block_message by default, got %q", cfg.Guardrail.BlockMessage)
+	}
 }
 
 func TestDefaultSkillActions(t *testing.T) {

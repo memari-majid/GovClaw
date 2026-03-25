@@ -367,6 +367,8 @@ def _fetch_ssm_token(param: str, region: str, profile: str | None) -> str | None
 @click.option("--cisco-api-key-env", default=None, help="Env var name holding Cisco AI Defense API key")
 @click.option("--cisco-timeout-ms", type=int, default=None, help="Cisco AI Defense timeout (ms)")
 @click.option("--port", "guard_port", type=int, default=None, help="LiteLLM proxy port")
+@click.option("--block-message", default=None,
+              help="Custom message shown when a request is blocked (empty = default)")
 @click.option("--restart", is_flag=True, help="Restart defenseclaw-gateway and openclaw gateway after setup")
 @click.option("--non-interactive", is_flag=True, help="Use flags instead of prompts")
 @pass_ctx
@@ -375,6 +377,7 @@ def setup_guardrail(
     disable: bool,
     guard_mode, guard_port,
     scanner_mode, cisco_endpoint, cisco_api_key_env, cisco_timeout_ms,
+    block_message,
     restart: bool,
     non_interactive: bool,
 ) -> None:
@@ -417,6 +420,8 @@ def setup_guardrail(
             gc.cisco_ai_defense.timeout_ms = cisco_timeout_ms
         if guard_port is not None:
             gc.port = guard_port
+        if block_message is not None:
+            gc.block_message = block_message
         gc.enabled = True
     else:
         _interactive_guardrail_setup(app, gc)
@@ -567,6 +572,9 @@ def setup_guardrail(
             _write_dotenv(dotenv_path, existing_dotenv)
             click.echo(f"  ✓ API keys written to {dotenv_path} (mode 0600)")
 
+    # --- Step 7: Write guardrail_runtime.json ---
+    _write_guardrail_runtime(app.cfg.data_dir, gc)
+
     # --- Summary ---
     click.echo()
     rows = [
@@ -576,6 +584,9 @@ def setup_guardrail(
         ("model_name", gc.model_name),
         ("api_key_env", gc.api_key_env),
     ]
+    if gc.block_message:
+        truncated = gc.block_message[:60] + "..." if len(gc.block_message) > 60 else gc.block_message
+        rows.append(("block_message", truncated))
     for key, val in rows:
         click.echo(f"    guardrail.{key + ':':<16s} {val}")
     click.echo()
@@ -637,6 +648,19 @@ def _interactive_guardrail_setup(app: AppContext, gc) -> None:
     gc.mode = click.prompt(
         "  Mode", type=click.Choice(["observe", "action"]), default=gc.mode or "observe",
     )
+
+    if gc.mode == "action":
+        click.echo()
+        click.echo("  When mode is 'action', blocked requests show a message to the user.")
+        if gc.block_message:
+            preview = gc.block_message[:80] + ("..." if len(gc.block_message) > 80 else "")
+            click.echo(f"  Current: \"{preview}\"")
+        else:
+            click.echo("  Default: \"I'm unable to process this request. DefenseClaw detected...\"")
+        if click.confirm("  Use a custom block message?", default=bool(gc.block_message)):
+            gc.block_message = click.prompt("  Block message", default=gc.block_message or "")
+        else:
+            gc.block_message = ""
 
     click.echo()
     click.echo("  Scanner modes:")
@@ -802,6 +826,25 @@ def _disable_guardrail(app: AppContext, gc, *, restart: bool = False) -> None:
         app.logger.log_action("setup-guardrail", "config", "disabled")
 
 
+def _write_guardrail_runtime(data_dir: str, gc) -> None:
+    """Write guardrail_runtime.json so the Python guardrail module can hot-reload settings."""
+    import json
+
+    runtime_file = os.path.join(data_dir, "guardrail_runtime.json")
+    payload = {
+        "mode": gc.mode,
+        "scanner_mode": gc.scanner_mode,
+        "block_message": gc.block_message,
+    }
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        with open(runtime_file, "w") as f:
+            json.dump(payload, f)
+        click.echo(f"  ✓ Guardrail runtime config written to {runtime_file}")
+    except OSError as exc:
+        click.echo(f"  ⚠ Failed to write runtime config: {exc}")
+
+
 def _find_guardrail_source() -> str | None:
     """Locate the guardrail module in the repo or package."""
     candidates = [
@@ -889,10 +932,15 @@ def _is_pid_alive(pid_file: str) -> bool:
     """Check if the process in the given PID file is alive (signal 0)."""
     try:
         with open(pid_file) as f:
-            pid = int(f.read().strip())
+            raw = f.read().strip()
+        try:
+            pid = int(raw)
+        except ValueError:
+            import json as _json
+            pid = _json.loads(raw)["pid"]
         os.kill(pid, 0)
         return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError, OSError):
+    except (FileNotFoundError, ValueError, KeyError, ProcessLookupError, PermissionError, OSError):
         return False
 
 

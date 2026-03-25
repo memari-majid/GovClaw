@@ -169,6 +169,7 @@ type GuardrailConfig struct {
 	GuardrailDir   string               `mapstructure:"guardrail_dir"    yaml:"guardrail_dir"`
 	LiteLLMConfig  string               `mapstructure:"litellm_config"   yaml:"litellm_config"`
 	OriginalModel  string               `mapstructure:"original_model"   yaml:"original_model"`
+	BlockMessage   string               `mapstructure:"block_message"    yaml:"block_message"`
 	CiscoAIDefense CiscoAIDefenseConfig `mapstructure:"cisco_ai_defense" yaml:"cisco_ai_defense"`
 }
 
@@ -328,6 +329,7 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("guardrail.port", 4000)
 	viper.SetDefault("guardrail.guardrail_dir", dataDir)
 	viper.SetDefault("guardrail.litellm_config", filepath.Join(dataDir, "litellm_config.yaml"))
+	viper.SetDefault("guardrail.block_message", "")
 	viper.SetDefault("guardrail.cisco_ai_defense.endpoint", "https://us.api.inspect.aidefense.security.cisco.com")
 	viper.SetDefault("guardrail.cisco_ai_defense.api_key_env", "CISCO_AI_DEFENSE_API_KEY")
 	viper.SetDefault("guardrail.cisco_ai_defense.timeout_ms", 3000)
