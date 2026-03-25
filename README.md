@@ -73,36 +73,40 @@ DefenseClaw is a **multi-component system** with three runtimes:
 
 ## Quick Start (5 minutes)
 
-### 1. Clone and build
+### 1. Clone, build, and install
 
 ```bash
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
 
-# Install Python CLI (requires uv)
-uv sync
+# Build and install everything (Python CLI + Go gateway + OpenClaw plugin)
+make install
+
+# Activate the Python environment
+source .venv/bin/activate
 
 # Initialize DefenseClaw
-uv run defenseclaw init
+defenseclaw init
 
 # Scan a skill
-uv run defenseclaw skill scan /path/to/skill
+defenseclaw skill scan /path/to/skill
 
 # Check status
-uv run defenseclaw status
+defenseclaw status
 
 # View alerts
-uv run defenseclaw alerts
+defenseclaw alerts
 ```
 
 ### Running Tests
 
 ```bash
-# Python CLI tests
-uv run pytest cli/tests/ -v
+# All tests (Python + Go)
+make test
 
-# Go orchestrator tests
-cd gateway && go test -race ./...
+# Individual
+make cli-test       # Python CLI tests
+make gateway-test   # Go gateway tests
 ```
 
 ### Deploy (Orchestrated)
@@ -541,17 +545,20 @@ defenseclaw/
 ## Building from Source
 
 ```bash
-# Python CLI (requires uv)
-uv sync
+# Build everything (Python CLI + Go gateway + OpenClaw plugin)
+make build
 
-# Go orchestrator daemon
-cd gateway && go build -o ../bin/gateway ./cmd/gateway
+# Or install everything (builds + copies binaries/plugin into place)
+make install
 
-# TypeScript plugin
-cd extensions/defenseclaw && npm install && npm run build
+# Individual components
+make pycli       # Python CLI → .venv/bin/defenseclaw
+make gateway     # Go gateway → ./defenseclaw-gateway
+make plugin      # TS plugin  → extensions/defenseclaw/dist/
 
-# Cross-compile Go daemon for DGX Spark
-cd gateway && GOOS=linux GOARCH=arm64 go build -o ../bin/gateway-linux-arm64 ./cmd/gateway
+# Individual installs
+make gateway-install   # → ~/.local/bin/defenseclaw-gateway
+make plugin-install    # → ~/.openclaw/extensions/defenseclaw/
 ```
 
 ---

@@ -1,0 +1,23 @@
+{
+  "id": "defenseclaw",
+  "name": "DefenseClaw Security",
+  "version": "0.2.0",
+  "enabledByDefault": true,
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "sidecarPort": {
+        "type": "integer",
+        "default": 18790,
+        "description": "Port for the DefenseClaw Go sidecar REST API"
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["observe", "action"],
+        "default": "observe",
+        "description": "Guardrail mode: observe (log only) or action (block threats)"
+      }
+    }
+  }
+}

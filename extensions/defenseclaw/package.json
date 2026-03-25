@@ -1,9 +1,12 @@
 {
-  "name": "@defenseclaw/openclaw-plugin",
+  "name": "defenseclaw",
   "version": "0.2.0",
   "description": "OpenClaw plugin for DefenseClaw — scan skills/plugins/MCPs, enforce policy, monitor runtime",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",

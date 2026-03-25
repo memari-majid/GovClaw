@@ -1,17 +1,8 @@
 declare module "@openclaw/plugin-sdk" {
-  interface AdmissionDecision {
-    allow: boolean;
-    reason?: string;
-  }
-
-  interface PluginApi {
-    on(event: string, handler: (...args: any[]) => void | Promise<void>): void;
-    guard(
-      event: string,
-      handler: (
-        ...args: any[]
-      ) => AdmissionDecision | Promise<AdmissionDecision>,
-    ): void;
+  interface BeforeToolCallEvent {
+    toolName: string;
+    args: Record<string, unknown>;
+    cancel(reason: string): void;
   }
 
   interface CommandArg {
@@ -20,23 +11,26 @@ declare module "@openclaw/plugin-sdk" {
     required?: boolean;
   }
 
-  interface CommandDef {
+  interface CommandRegistration {
+    name: string;
     description: string;
     args?: CommandArg[];
     handler: (ctx: { args: Record<string, unknown> }) => Promise<{ text: string }> | { text: string };
   }
 
-  interface ServiceDef {
+  interface ServiceRegistration {
+    id: string;
     start: () => Promise<{ stop: () => void }>;
   }
 
-  interface PluginContext {
-    api: PluginApi;
-    registerService(name: string, def: ServiceDef): void;
-    registerCommand(name: string, def: CommandDef): void;
+  export interface PluginApi {
+    on(event: "before_tool_call", handler: (event: BeforeToolCallEvent) => void | Promise<void>): void;
+    on(event: string, handler: (...args: any[]) => void | Promise<void>): void;
+    registerCommand(def: CommandRegistration): void;
+    registerService(def: ServiceRegistration): void;
   }
 
-  type PluginEntry = (ctx: PluginContext) => void;
+  type PluginEntry = (api: PluginApi) => void;
 
-  export function definePluginEntry(fn: (ctx: PluginContext) => void): PluginEntry;
+  export function definePluginEntry(fn: PluginEntry): PluginEntry;
 }

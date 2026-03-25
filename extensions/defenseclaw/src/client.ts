@@ -7,9 +7,7 @@ import type {
   DaemonStatus,
   AdmissionResult,
 } from "./types.js";
-
-const DEFAULT_BASE_URL =
-  process.env["DEFENSECLAW_DAEMON_URL"] || "http://127.0.0.1:18790";
+import { loadSidecarConfig } from "./sidecar-config.js";
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 type RequestImpl = typeof httpRequest;
@@ -33,7 +31,7 @@ export class DaemonClient {
   private readonly requestImpl: RequestImpl;
 
   constructor(opts?: ClientOptions) {
-    this.baseUrl = opts?.baseUrl ?? DEFAULT_BASE_URL;
+    this.baseUrl = opts?.baseUrl ?? loadSidecarConfig().baseUrl;
     this.timeoutMs = opts?.timeoutMs ?? REQUEST_TIMEOUT_MS;
     this.requestImpl = opts?.requestImpl ?? httpRequest;
   }

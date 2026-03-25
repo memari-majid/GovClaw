@@ -58,15 +58,12 @@ Use this if OpenClaw is already running on your system.
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
 
-# Build for linux/arm64
-make build-linux-arm64
+# Build and install everything (Python CLI + Go gateway + OpenClaw plugin)
+make install
 
-# Install the binary
-sudo cp defenseclaw-linux-arm64 /usr/local/bin/defenseclaw
-sudo chmod +x /usr/local/bin/defenseclaw
-
-# Verify
-defenseclaw --help
+# Or build individual components
+make gateway              # Go gateway binary only
+make build-linux-arm64    # Cross-compile gateway for DGX Spark
 ```
 
 If you are cross-compiling from a different machine (e.g., your Mac):
@@ -171,18 +168,17 @@ Install Go if needed:
 brew install go
 ```
 
-#### Step 1: Build DefenseClaw
+#### Step 1: Build and Install DefenseClaw
 
 ```bash
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
 
-# Build for Apple Silicon
-make build
+# Build and install everything (Python CLI + Go gateway + OpenClaw plugin)
+make install
 
-# Install
-sudo cp defenseclaw /usr/local/bin/
-sudo chmod +x /usr/local/bin/defenseclaw
+# Activate the Python environment
+source .venv/bin/activate
 
 # Verify
 defenseclaw --help
@@ -344,6 +340,11 @@ mkdir -p ~/.openclaw/skills
 ```bash
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
+
+# Full install (Python CLI + Go gateway + OpenClaw plugin)
+make install
+
+# Or for DGX Spark cross-compile only:
 make build-linux-arm64
 sudo cp defenseclaw-linux-arm64 /usr/local/bin/defenseclaw
 sudo chmod +x /usr/local/bin/defenseclaw
@@ -444,12 +445,13 @@ YAML
 # Install Go if needed
 brew install go
 
-# Build
+# Clone and install
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
-make build
-sudo cp defenseclaw /usr/local/bin/
-sudo chmod +x /usr/local/bin/defenseclaw
+make install
+
+# Activate the Python environment
+source .venv/bin/activate
 ```
 
 #### Step 4: Initialize and deploy
@@ -548,13 +550,12 @@ defenseclaw deploy ~/.openclaw/
 cd defenseclaw
 git pull origin main
 
-# DGX Spark
-make build-linux-arm64
-sudo cp defenseclaw-linux-arm64 /usr/local/bin/defenseclaw
+# Rebuild and reinstall everything
+make install
 
-# macOS
-make build
-sudo cp defenseclaw /usr/local/bin/defenseclaw
+# Or upgrade individual components
+make gateway-install    # Go gateway only
+make plugin-install     # OpenClaw plugin only
 
 # Verify
 defenseclaw --version

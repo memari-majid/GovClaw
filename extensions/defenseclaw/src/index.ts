@@ -3,13 +3,8 @@
  *
  * Integrates DefenseClaw security into the OpenClaw plugin lifecycle:
  *
- * Boot-time:
- *  - Syncs block/allow lists from the Go daemon
- *  - Verifies sidecar reachability on gateway_start
- *
- * Lifecycle hooks:
- *  - skill_install / skill_uninstall: admission gate for skills
- *  - mcp_connect / mcp_disconnect: admission gate for MCP servers
+ * Runtime:
+ *  - before_tool_call: intercepts tool calls via the Go sidecar inspect API
  *
  * Slash commands:
  *  - /scan <path>: scan a skill directory
@@ -19,21 +14,20 @@
  * The plugin uses:
  *  1. Native TS scanners for plugins and MCP configs (in-process, fast)
  *  2. CLI shell-out to `defenseclaw` for skill/code scans (full scanner suite)
- *  3. REST API to the Go daemon for policy state and audit logging
+ *  3. REST API to the Go sidecar for tool inspection and audit logging
  */
 
-import { definePluginEntry } from "@openclaw/plugin-sdk";
-import { DaemonClient } from "./client.js";
+import type { PluginApi } from "@openclaw/plugin-sdk";
 import { PolicyEnforcer, runSkillScan } from "./policy/enforcer.js";
 import { scanPlugin } from "./scanners/plugin_scanner/index.js";
 import { scanMCPServer } from "./scanners/mcp-scanner.js";
 import type {
   ScanResult,
-  AdmissionResult,
   Finding,
   InstallType,
 } from "./types.js";
 import { compareSeverity, maxSeverity } from "./types.js";
+import { loadSidecarConfig } from "./sidecar-config.js";
 
 function formatFindings(findings: Finding[], limit = 15): string[] {
   const lines: string[] = [];
@@ -53,131 +47,80 @@ function formatFindings(findings: Finding[], limit = 15): string[] {
   return lines;
 }
 
-function formatAdmissionResult(result: AdmissionResult): string {
-  const icon =
-    result.verdict === "clean" || result.verdict === "allowed"
-      ? "PASS"
-      : result.verdict === "warning"
-        ? "WARN"
-        : "FAIL";
-
-  return `[${icon}] ${result.type} "${result.name}": ${result.verdict} — ${result.reason}`;
-}
-
-export default definePluginEntry(({ api, registerService, registerCommand }) => {
-  const client = new DaemonClient();
+export default function (api: PluginApi) {
   const enforcer = new PolicyEnforcer();
 
-  // ─── Background service: sync block/allow lists from sidecar ───
+  // ─── Runtime: tool call interception ───
 
-  registerService("defenseclaw-watcher", {
-    start: async () => {
-      try {
-        await enforcer.syncFromDaemon();
-        console.log("[defenseclaw] block/allow lists synced from sidecar");
-      } catch (err) {
-        console.error(
-          `[defenseclaw] failed to sync from sidecar: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        console.error(
-          "[defenseclaw] WARNING: operating without daemon sync — enforcement may be stale",
-        );
-      }
+  const SIDECAR_API = loadSidecarConfig().baseUrl;
+  const INSPECT_TIMEOUT_MS = 2_000;
 
-      return {
-        stop: () => undefined,
+  async function inspectTool(
+    payload: Record<string, unknown>,
+  ): Promise<{ action: string; severity: string; reason: string; mode: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), INSPECT_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${SIDECAR_API}/api/v1/inspect/tool`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      return (await res.json()) as {
+        action: string;
+        severity: string;
+        reason: string;
+        mode: string;
       };
-    },
-  });
-
-  // ─── Lifecycle: gateway_start ───
-
-  api.on("gateway_start", async () => {
-    console.log("[defenseclaw] gateway started — syncing state from sidecar...");
-
-    const health = await client.status();
-    if (health.ok) {
-      console.log("[defenseclaw] sidecar is reachable");
-    } else {
-      console.error(
-        `[defenseclaw] WARNING: sidecar unreachable (${health.error ?? "unknown"}) — ` +
-        "enforcement will use local cache only. Ensure defenseclaw-gateway is running.",
-      );
+    } catch {
+      return { action: "allow", severity: "NONE", reason: "sidecar unreachable", mode: "observe" };
+    } finally {
+      clearTimeout(timer);
     }
+  }
 
-    await enforcer.syncFromDaemon().catch(() => {
-      console.error("[defenseclaw] failed to sync block/allow lists from sidecar");
-    });
-  });
+  api.on("before_tool_call", async (event) => {
+    if (event.toolName === "message") {
+      const content =
+        (event.args?.content as string) || (event.args?.body as string) || "";
+      if (!content) return;
 
-  // ─── Lifecycle: skill install/uninstall ───
+      const verdict = await inspectTool({
+        tool: "message",
+        args: event.args,
+        content,
+        direction: "outbound",
+      });
 
-  api.guard("skill_install", async (event: { name: string; path: string }) => {
-    console.log(`[defenseclaw] skill install detected: ${event.name}`);
-
-    const result = await enforcer.evaluateSkill(event.path, event.name);
-    console.log(`[defenseclaw] ${formatAdmissionResult(result)}`);
-
-    if (result.verdict === "rejected" || result.verdict === "blocked" || result.verdict === "scan-error") {
-      return { allow: false, reason: result.reason };
-    }
-
-    return { allow: true };
-  });
-
-  api.on("skill_uninstall", async (event: { name: string; path: string }) => {
-    console.log(`[defenseclaw] skill uninstalled: ${event.name}`);
-    await client
-      .logEvent({
-        action: "skill.uninstall",
-        target: event.path,
-        actor: "openclaw",
-        severity: "INFO",
-        details: JSON.stringify({ name: event.name }),
-      })
-      .catch(() => {});
-  });
-
-  // ─── Lifecycle: MCP connect/disconnect ───
-
-  api.guard("mcp_connect", async (event: { name: string; config_path?: string }) => {
-    console.log(`[defenseclaw] MCP server connecting: ${event.name}`);
-
-    if (event.config_path) {
-      const result = await enforcer.evaluateMCPServer(
-        event.config_path,
-        event.name,
-      );
-      console.log(`[defenseclaw] ${formatAdmissionResult(result)}`);
-
-      if (result.verdict === "rejected" || result.verdict === "blocked" || result.verdict === "scan-error") {
-        return { allow: false, reason: result.reason };
-      }
-    } else {
       console.log(
-        `[defenseclaw] MCP "${event.name}" connected (no config path — skipping scan)`,
+        `[defenseclaw] message-tool verdict:${verdict.action} severity:${verdict.severity}`,
       );
+
+      if (verdict.action === "block" && verdict.mode === "action") {
+        event.cancel(`DefenseClaw: outbound blocked — ${verdict.reason}`);
+      }
+      return;
     }
 
-    return { allow: true };
-  });
+    const verdict = await inspectTool({
+      tool: event.toolName,
+      args: event.args,
+    });
 
-  api.on("mcp_disconnect", async (event: { name: string }) => {
-    console.log(`[defenseclaw] MCP server disconnected: ${event.name}`);
-    await client
-      .logEvent({
-        action: "mcp.disconnect",
-        target: event.name,
-        actor: "openclaw",
-        severity: "INFO",
-        details: JSON.stringify({ name: event.name }),
-      })
-      .catch(() => {});
+    console.log(
+      `[defenseclaw] tool:${event.toolName} verdict:${verdict.action} severity:${verdict.severity}`,
+    );
+
+    if (verdict.action === "block" && verdict.mode === "action") {
+      event.cancel(`DefenseClaw: ${verdict.reason}`);
+    }
   });
 
   // ─── Slash command: /scan ───
 
-  registerCommand("/scan", {
+  api.registerCommand({
+    name: "scan",
     description: "Scan a skill, plugin, or MCP config with DefenseClaw",
     args: [
       { name: "target", description: "Path to skill/plugin directory or MCP config", required: true },
@@ -205,7 +148,8 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
 
   // ─── Slash command: /block ───
 
-  registerCommand("/block", {
+  api.registerCommand({
+    name: "block",
     description: "Block a skill, MCP server, or plugin",
     args: [
       { name: "type", description: "Target type: skill, mcp, plugin", required: true },
@@ -230,7 +174,8 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
 
   // ─── Slash command: /allow ───
 
-  registerCommand("/allow", {
+  api.registerCommand({
+    name: "allow",
     description: "Allow-list a skill, MCP server, or plugin",
     args: [
       { name: "type", description: "Target type: skill, mcp, plugin", required: true },
@@ -252,7 +197,7 @@ export default definePluginEntry(({ api, registerService, registerCommand }) => 
       };
     },
   });
-});
+}
 
 // ─── Scan handlers ───
 

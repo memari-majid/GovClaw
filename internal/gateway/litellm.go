@@ -136,6 +136,23 @@ func (l *LiteLLMProcess) runProcess(ctx context.Context, binary string) error {
 func (l *LiteLLMProcess) buildEnv() []string {
 	env := os.Environ()
 
+	// Load ~/.defenseclaw/.env for daemon contexts where the user's
+	// shell environment (and its API keys) aren't inherited.
+	envFile := filepath.Join(filepath.Dir(l.cfg.LiteLLMConfig), ".env")
+	if dotenv, err := loadDotEnv(envFile); err == nil {
+		present := make(map[string]bool, len(env))
+		for _, e := range env {
+			if k, _, ok := strings.Cut(e, "="); ok {
+				present[k] = true
+			}
+		}
+		for k, v := range dotenv {
+			if !present[k] {
+				env = append(env, k+"="+v)
+			}
+		}
+	}
+
 	pythonPath := l.cfg.GuardrailDir
 	for _, e := range env {
 		if strings.HasPrefix(e, "PYTHONPATH=") {
@@ -145,11 +162,20 @@ func (l *LiteLLMProcess) buildEnv() []string {
 		}
 	}
 
-	filtered := make([]string, 0, len(env)+2)
+	// Vars we set explicitly — filter out any inherited copies to avoid
+	// duplicates (last-writer-wins is OS-dependent).
+	overridden := map[string]bool{
+		"PYTHONPATH":                  true,
+		"DEFENSECLAW_GUARDRAIL_MODE":  true,
+		"DEFENSECLAW_SCANNER_MODE":    true,
+		"DEFENSECLAW_API_PORT":        true,
+	}
+	filtered := make([]string, 0, len(env)+6)
 	for _, e := range env {
-		if !strings.HasPrefix(e, "PYTHONPATH=") {
-			filtered = append(filtered, e)
+		if k, _, ok := strings.Cut(e, "="); ok && overridden[k] {
+			continue
 		}
+		filtered = append(filtered, e)
 	}
 	filtered = append(filtered, "PYTHONPATH="+pythonPath)
 	filtered = append(filtered, "DEFENSECLAW_GUARDRAIL_MODE="+l.cfg.Mode)
@@ -241,4 +267,35 @@ func (l *LiteLLMProcess) findBinary() (string, error) {
 	}
 
 	return "", fmt.Errorf("litellm binary not found — install with: uv tool install 'litellm[proxy]'")
+}
+
+// loadDotEnv reads a KEY=VALUE file (one per line).  Blank lines and
+// lines starting with # are ignored.  Values may be optionally quoted.
+// This lets the sidecar pick up API keys when running as a daemon
+// (where the user's shell env isn't inherited).
+func loadDotEnv(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+			v = v[1 : len(v)-1]
+		}
+		if k != "" {
+			out[k] = v
+		}
+	}
+	return out, nil
 }

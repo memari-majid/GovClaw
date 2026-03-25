@@ -30,21 +30,27 @@ pip install -e cli
 defenseclaw --help
 ```
 
-## Option B: Go CLI
+## Option B: Full Install (CLI + Gateway + Plugin)
 
-Build from source if you need the Go binary (required for TUI and sidecar daemon).
+Build and install all components from source.
 
 ```bash
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
-make build
+
+# Build and install everything
+make install
+
+# Activate the Python environment
+source .venv/bin/activate
 ```
 
-For DGX Spark (linux/arm64):
+To build individual components:
 
 ```bash
-make build-linux-arm64
-scp defenseclaw-linux-arm64 spark:/usr/local/bin/defenseclaw
+make pycli     # Python CLI only
+make gateway   # Go gateway only
+make plugin    # OpenClaw plugin only
 ```
 
 ## 2. Initialize

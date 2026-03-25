@@ -61,12 +61,42 @@ EXFIL_PATTERNS = [
 
 _SEVERITY_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
-_CISCO_SEVERITY_MAP = {
-    "NONE_SEVERITY": "NONE",
-    "LOW": "LOW",
-    "MEDIUM": "MEDIUM",
-    "HIGH": "HIGH",
-}
+
+# ---------------------------------------------------------------------------
+# Cross-instance verdict cache
+#
+# LiteLLM creates a *separate* guardrail instance per mode (pre_call,
+# during_call, post_call).  To pass the pre_call verdict to during_call's
+# moderation hook we use a module-level cache keyed by the data dict id.
+# Entries expire after _VERDICT_TTL seconds to prevent leaks.
+# ---------------------------------------------------------------------------
+
+_verdict_cache: dict[int, tuple[dict[str, Any], float]] = {}
+_VERDICT_TTL = 30.0
+_VERDICT_CLEANUP_INTERVAL = 60.0
+_last_verdict_cleanup: float = 0.0
+
+
+def _cache_verdict(data_id: int, verdict: dict[str, Any]) -> None:
+    global _last_verdict_cleanup
+    _verdict_cache[data_id] = (verdict, time.monotonic())
+    now = time.monotonic()
+    if now - _last_verdict_cleanup > _VERDICT_CLEANUP_INTERVAL:
+        _last_verdict_cleanup = now
+        cutoff = now - _VERDICT_TTL
+        stale = [k for k, (_, ts) in _verdict_cache.items() if ts < cutoff]
+        for k in stale:
+            _verdict_cache.pop(k, None)
+
+
+def _pop_verdict(data_id: int) -> dict[str, Any] | None:
+    entry = _verdict_cache.pop(data_id, None)
+    if entry is None:
+        return None
+    verdict, ts = entry
+    if time.monotonic() - ts > _VERDICT_TTL:
+        return None
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +474,7 @@ class DefenseClawGuardrail(CustomGuardrail):
         call_type: Any | None = None,
     ) -> Exception | str | dict[str, Any] | None:
         messages = data.get("messages", [])
-        text = self._messages_to_text(messages)
+        text = self._last_user_text(messages)
         if not text:
             return data
 
@@ -462,11 +492,46 @@ class DefenseClawGuardrail(CustomGuardrail):
         self._log_pre_call(ts, model, messages, severity, action, reason, elapsed_ms)
         self._report_to_sidecar("prompt", model, verdict, elapsed_ms)
 
+        _cache_verdict(id(data), verdict)
+
         if action == "block" and self.mode == "action":
             data["mock_response"] = self._block_message("prompt", reason)
-            return data
 
         return data
+
+    # ------------------------------------------------------------------
+    # MODERATION: runs in parallel with LLM call
+    #
+    # When pre_call already set mock_response (blocked the prompt),
+    # this is a no-op.  Otherwise runs an independent scan and blocks
+    # via mock_response on the data dict.
+    # ------------------------------------------------------------------
+
+    async def async_moderation_hook(
+        self,
+        data: dict[str, Any],
+        user_api_key_dict: UserAPIKeyAuth,
+        call_type: Any | None = None,
+    ) -> None:
+        if data.get("mock_response"):
+            return
+
+        cached = _pop_verdict(id(data))
+        if cached:
+            action = cached.get("action", "allow")
+            reason = cached.get("reason", "")
+        else:
+            messages = data.get("messages", [])
+            text = self._last_user_text(messages)
+            if not text:
+                return
+            model = data.get("model", "?")
+            verdict = self._inspect("prompt", text, messages, model=model)
+            action = verdict.get("action", "allow")
+            reason = verdict.get("reason", "")
+
+        if action == "block" and self.mode == "action":
+            data["mock_response"] = self._block_message("prompt", reason)
 
     # ------------------------------------------------------------------
     # POST-CALL: inspect completion after LLM responds
@@ -537,6 +602,7 @@ class DefenseClawGuardrail(CustomGuardrail):
         self,
         user_api_key_dict: UserAPIKeyAuth,
         response: Any,
+        request_data: dict[str, Any] | None = None,
     ):
         """Inspect streaming responses by buffering chunks and scanning periodically.
 
@@ -668,11 +734,12 @@ class DefenseClawGuardrail(CustomGuardrail):
         severity: str, action: str, reason: str, elapsed_ms: float,
     ) -> None:
         sev_color = GREEN if severity == "NONE" else YELLOW if severity == "MEDIUM" else RED
-        print(f"\n{BOLD}{BLUE}{'─'*60}{RESET}")
+        print(f"\n{BOLD}{BLUE}{'─'*60}{RESET}", file=sys.stderr)
         print(
             f"{BLUE}[{ts}]{RESET} {BOLD}PRE-CALL{RESET}  "
             f"model={model}  messages={len(messages)}  "
-            f"{DIM}{elapsed_ms:.0f}ms{RESET}"
+            f"{DIM}{elapsed_ms:.0f}ms{RESET}",
+            file=sys.stderr,
         )
 
         for i, msg in enumerate(messages):
@@ -680,14 +747,14 @@ class DefenseClawGuardrail(CustomGuardrail):
             text = self._extract_content(msg)
             preview = text[:120] + ("..." if len(text) > 120 else "")
             rc = YELLOW if role == "user" else GREEN if role == "assistant" else DIM
-            print(f"  {DIM}[{i}]{RESET} {rc}{role}{RESET}: {preview}")
+            print(f"  {DIM}[{i}]{RESET} {rc}{role}{RESET}: {preview}", file=sys.stderr)
 
         verdict_label = f"{sev_color}{severity}{RESET}"
         if severity == "NONE":
-            print(f"  verdict: {verdict_label}")
+            print(f"  verdict: {verdict_label}", file=sys.stderr)
         else:
-            print(f"  verdict: {verdict_label}  action={action}  {reason}")
-        print(f"{BLUE}{'─'*60}{RESET}")
+            print(f"  verdict: {verdict_label}  action={action}  {reason}", file=sys.stderr)
+        print(f"{BLUE}{'─'*60}{RESET}", file=sys.stderr)
 
     def _log_post_call(
         self, ts: str, model: str, content: str,
@@ -695,30 +762,31 @@ class DefenseClawGuardrail(CustomGuardrail):
         reason: str, usage: Any, elapsed_ms: float,
     ) -> None:
         sev_color = GREEN if severity == "NONE" else YELLOW if severity == "MEDIUM" else RED
-        print(f"\n{BOLD}{GREEN}{'─'*60}{RESET}")
+        print(f"\n{BOLD}{GREEN}{'─'*60}{RESET}", file=sys.stderr)
         tokens_str = ""
         if usage:
             tokens_str = f"  in={getattr(usage, 'prompt_tokens', '?')} out={getattr(usage, 'completion_tokens', '?')}"
         print(
             f"{GREEN}[{ts}]{RESET} {BOLD}POST-CALL{RESET}  "
             f"model={model}{tokens_str}  "
-            f"{DIM}{elapsed_ms:.0f}ms{RESET}"
+            f"{DIM}{elapsed_ms:.0f}ms{RESET}",
+            file=sys.stderr,
         )
 
         if content:
             preview = content[:200] + ("..." if len(content) > 200 else "")
-            print(f"  content: {preview}")
+            print(f"  content: {preview}", file=sys.stderr)
 
         if tool_calls:
             for tc in tool_calls:
-                print(f"  tool: {YELLOW}{tc['name']}{RESET}({tc['args'][:80]})")
+                print(f"  tool: {YELLOW}{tc['name']}{RESET}({tc['args'][:80]})", file=sys.stderr)
 
         verdict_label = f"{sev_color}{severity}{RESET}"
         if severity == "NONE":
-            print(f"  verdict: {verdict_label}")
+            print(f"  verdict: {verdict_label}", file=sys.stderr)
         else:
-            print(f"  verdict: {verdict_label}  action={action}  {reason}")
-        print(f"{GREEN}{'─'*60}{RESET}")
+            print(f"  verdict: {verdict_label}  action={action}  {reason}", file=sys.stderr)
+        print(f"{GREEN}{'─'*60}{RESET}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Blocking helpers
@@ -763,17 +831,26 @@ class DefenseClawGuardrail(CustomGuardrail):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _messages_to_text(messages: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for msg in messages:
+    def _last_user_text(messages: list[dict[str, Any]]) -> str:
+        """Extract text from only the most recent user message.
+
+        Scanning the full conversation history causes false positives:
+        once a flagged message enters the history (even if already
+        blocked), every subsequent turn would be blocked because the
+        old patterns are still in the concatenated text.
+        """
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
             c = msg.get("content", "")
             if isinstance(c, str):
-                parts.append(c)
-            elif isinstance(c, list):
-                for block in c:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-        return "\n".join(parts)
+                return c
+            if isinstance(c, list):
+                return " ".join(
+                    b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+        return ""
 
     @staticmethod
     def _extract_content(msg: dict[str, Any]) -> str:

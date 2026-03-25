@@ -154,6 +154,36 @@ def _mask(key: str) -> str:
     return key[:4] + "..." + key[-4:]
 
 
+def _load_dotenv(path: str) -> dict[str, str]:
+    """Read a KEY=VALUE .env file into a dict."""
+    result: dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                    v = v[1:-1]
+                if k:
+                    result[k] = v
+    except FileNotFoundError:
+        pass
+    return result
+
+
+def _write_dotenv(path: str, entries: dict[str, str]) -> None:
+    """Write entries to a .env file with mode 0600."""
+    lines = [f"{k}={v}\n" for k, v in sorted(entries.items())]
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.writelines(lines)
+
+
 def _print_summary(sc) -> None:
     click.echo()
     click.echo("  Saved to ~/.defenseclaw/config.yaml")
@@ -363,6 +393,7 @@ def setup_guardrail(
     from defenseclaw.guardrail import (
         generate_litellm_config,
         install_guardrail_module,
+        install_openclaw_plugin,
         patch_openclaw_config,
         write_litellm_config,
     )
@@ -394,7 +425,27 @@ def setup_guardrail(
         click.echo("  Guardrail not enabled. Run again without declining to configure.")
         return
 
-    # Generate LiteLLM config
+    warnings: list[str] = []
+
+    # --- Pre-flight checks ---
+    claw_cfg_file = app.cfg.claw.config_file
+    oc_config_path = (
+        os.path.expanduser(claw_cfg_file) if claw_cfg_file.startswith("~/") else claw_cfg_file
+    )
+    if not os.path.isfile(oc_config_path):
+        click.echo(f"  ✗ OpenClaw config not found: {app.cfg.claw.config_file}")
+        click.echo("    Make sure OpenClaw is installed and initialized.")
+        click.echo("    Expected location: ~/.openclaw/openclaw.json")
+        return
+
+    if not gc.model or not gc.model_name:
+        click.echo("  ✗ Model or model_name is empty — cannot configure guardrail.")
+        click.echo("    Run interactively (without --non-interactive) to set the model.")
+        return
+
+    click.echo()
+
+    # --- Step 1: Generate and write LiteLLM config ---
     litellm_cfg = generate_litellm_config(
         model=gc.model,
         model_name=gc.model_name,
@@ -402,18 +453,62 @@ def setup_guardrail(
         port=gc.port,
         device_key_file=app.cfg.gateway.device_key_file,
     )
-    write_litellm_config(litellm_cfg, gc.litellm_config)
+    ok, err = write_litellm_config(litellm_cfg, gc.litellm_config)
+    if ok:
+        click.echo(f"  ✓ LiteLLM config written to {gc.litellm_config}")
+    else:
+        click.echo(f"  ✗ Failed to write LiteLLM config: {err}")
+        click.echo(f"    Check permissions on {os.path.dirname(gc.litellm_config)}")
+        return
 
-    # Install guardrail module
+    # --- Step 2: Install guardrail module ---
     repo_source = _find_guardrail_source()
     if repo_source:
-        install_guardrail_module(repo_source, gc.guardrail_dir)
+        ok, err = install_guardrail_module(repo_source, gc.guardrail_dir)
+        if ok:
+            click.echo(f"  ✓ Guardrail module installed to {gc.guardrail_dir}/")
+        else:
+            click.echo(f"  ✗ Failed to install guardrail module: {err}")
+            warnings.append("Guardrail module not installed — LLM inspection will not work")
+    else:
+        click.echo("  ⚠ Guardrail module not found in repo")
+        warnings.append(
+            "Guardrail module not found — if running from a pip install, "
+            "ensure defenseclaw_guardrail.py is in the guardrail_dir"
+        )
 
-    # Derive the master key for OpenClaw config
+    # --- Step 3: Install OpenClaw plugin ---
+    plugin_source = _find_plugin_source()
+    if plugin_source:
+        openclaw_home = app.cfg.claw.home_dir
+        method, cli_error = install_openclaw_plugin(plugin_source, openclaw_home)
+        if method == "cli":
+            click.echo("  ✓ OpenClaw plugin installed (via openclaw CLI)")
+        elif method == "manual":
+            click.echo("  ✓ OpenClaw plugin installed to extensions/")
+        elif method == "error":
+            click.echo(f"  ✗ OpenClaw plugin installation failed: {cli_error}")
+            warnings.append(
+                "Plugin not installed — tool interception will not work. "
+                "Try: make plugin-install && defenseclaw setup guardrail"
+            )
+        else:
+            click.echo("  ⚠ OpenClaw plugin not built — run 'make plugin && make plugin-install'")
+            warnings.append(
+                "Plugin not built — tool interception will not work. "
+                "Build with: make plugin && make plugin-install"
+            )
+    else:
+        click.echo("  ⚠ OpenClaw plugin not found at ~/.defenseclaw/extensions/")
+        warnings.append(
+            "Plugin not found — run 'make plugin-install' to stage it, "
+            "then re-run setup"
+        )
+
+    # --- Step 4: Patch OpenClaw config ---
     from defenseclaw.guardrail import _derive_master_key
     master_key = _derive_master_key(app.cfg.gateway.device_key_file)
 
-    # Patch OpenClaw config
     prev_model = patch_openclaw_config(
         openclaw_config_file=app.cfg.claw.config_file,
         model_name=gc.model_name,
@@ -421,16 +516,91 @@ def setup_guardrail(
         master_key=master_key,
         original_model=gc.original_model,
     )
-    if prev_model and not gc.original_model:
-        gc.original_model = prev_model
+    if prev_model is not None:
+        click.echo(f"  ✓ OpenClaw config patched: {app.cfg.claw.config_file}")
+        if prev_model and not gc.original_model:
+            gc.original_model = prev_model
+    else:
+        click.echo(f"  ✗ Failed to patch OpenClaw config: {app.cfg.claw.config_file}")
+        click.echo("    File may be malformed or unreadable. Check the JSON syntax.")
+        warnings.append(
+            "OpenClaw config not patched — LLM traffic will not be routed through the guardrail. "
+            f"Fix {app.cfg.claw.config_file} and re-run setup"
+        )
 
-    app.cfg.save()
+    # --- Step 5: Save DefenseClaw config ---
+    try:
+        app.cfg.save()
+        click.echo("  ✓ Config saved to ~/.defenseclaw/config.yaml")
+    except OSError as exc:
+        click.echo(f"  ✗ Failed to save config: {exc}")
+        warnings.append("Config not saved — settings will be lost on next run")
+
+    if gc.original_model:
+        click.echo(f"  ✓ Original model saved for revert: {gc.original_model}")
+
+    # --- Step 6: Write .env file for API keys ---
+    # The sidecar runs as a daemon and won't inherit the user's shell env,
+    # so we persist API keys to ~/.defenseclaw/.env (mode 0600).
+    if gc.api_key_env:
+        env_val = os.environ.get(gc.api_key_env, "")
+        dotenv_path = os.path.join(os.path.dirname(gc.litellm_config), ".env")
+        existing_dotenv = _load_dotenv(dotenv_path)
+
+        if not env_val and gc.api_key_env not in existing_dotenv:
+            click.echo()
+            click.echo(f"  ⚠ {gc.api_key_env} is not set in your current environment")
+            env_val = click.prompt(
+                f"  Enter the value for {gc.api_key_env}",
+                hide_input=True,
+                default="",
+            )
+            if not env_val:
+                click.echo("    Skipped — the LiteLLM proxy will fail without this key.")
+                click.echo(f"    You can set it later in {dotenv_path}")
+                warnings.append(f"{gc.api_key_env} not set — sidecar will fail to start")
+
+        if env_val:
+            existing_dotenv[gc.api_key_env] = env_val
+
+        if existing_dotenv:
+            _write_dotenv(dotenv_path, existing_dotenv)
+            click.echo(f"  ✓ API keys written to {dotenv_path} (mode 0600)")
+
+    # --- Summary ---
+    click.echo()
+    rows = [
+        ("mode", gc.mode),
+        ("port", str(gc.port)),
+        ("model", gc.model),
+        ("model_name", gc.model_name),
+        ("api_key_env", gc.api_key_env),
+    ]
+    for key, val in rows:
+        click.echo(f"    guardrail.{key + ':':<16s} {val}")
+    click.echo()
+
+    if warnings:
+        click.echo("  ── Warnings ──────────────────────────────────────────")
+        for w in warnings:
+            click.echo(f"  ⚠ {w}")
+        click.echo()
 
     data_dir = os.path.dirname(gc.litellm_config) if gc.litellm_config else os.path.expanduser("~/.defenseclaw")
-    _print_guardrail_summary(gc, app.cfg.claw.config_file, restart=restart)
-
     if restart:
-        _restart_services(data_dir)
+        _restart_services(data_dir, app.cfg.gateway.host, app.cfg.gateway.port)
+    else:
+        click.echo("  Next steps:")
+        click.echo("    1. Restart the defenseclaw sidecar:")
+        click.echo("       defenseclaw-gateway restart")
+        click.echo("       (openclaw gateway auto-reloads — no restart needed)")
+        click.echo("    2. Or re-run with --restart:")
+        click.echo("       defenseclaw setup guardrail --restart")
+        click.echo()
+
+    click.echo("  To disable and revert:")
+    click.echo("    defenseclaw setup guardrail --disable")
+    click.echo()
 
     if app.logger:
         app.logger.log_action(
@@ -541,43 +711,88 @@ def _interactive_guardrail_setup(app: AppContext, gc) -> None:
         gc.api_key_env = detect_api_key_env(gc.model)
 
     env_val = os.environ.get(gc.api_key_env, "")
+    dotenv_path = os.path.join(os.path.dirname(gc.litellm_config), ".env")
+    existing_dotenv = _load_dotenv(dotenv_path)
+    dotenv_val = existing_dotenv.get(gc.api_key_env, "")
     click.echo()
     if env_val:
         click.echo(f"  API key env var: {gc.api_key_env} ({_mask(env_val)})")
         if not click.confirm("  Use this env var?", default=True):
             gc.api_key_env = _prompt_env_var_name(gc.api_key_env)
+    elif dotenv_val:
+        click.echo(f"  API key: {gc.api_key_env} ({_mask(dotenv_val)}) — from {dotenv_path}")
+        if not click.confirm("  Use this key?", default=True):
+            gc.api_key_env = _prompt_env_var_name(gc.api_key_env)
     else:
-        click.echo(f"  API key env var: {gc.api_key_env} (not currently set in environment)")
-        click.echo("  Set it before starting the sidecar:")
-        click.echo(f"    export {gc.api_key_env}=your-key-here")
+        click.echo(f"  API key env var: {gc.api_key_env} (not set in environment or .env)")
+        click.echo("  The key will be saved to ~/.defenseclaw/.env during setup.")
         gc.api_key_env = _prompt_env_var_name(gc.api_key_env)
 
 
 def _disable_guardrail(app: AppContext, gc, *, restart: bool = False) -> None:
-    from defenseclaw.guardrail import restore_openclaw_config
+    from defenseclaw.guardrail import restore_openclaw_config, uninstall_openclaw_plugin
 
     click.echo()
     click.echo("  Disabling LLM guardrail...")
+    warnings: list[str] = []
 
+    # Restore OpenClaw config (model + remove litellm provider + plugins.allow)
     if gc.original_model:
         if restore_openclaw_config(app.cfg.claw.config_file, gc.original_model):
             click.echo(f"  ✓ OpenClaw model restored to: {gc.original_model}")
         else:
-            click.echo("  ⚠ Could not restore OpenClaw config")
+            click.echo(f"  ✗ Could not restore OpenClaw config: {app.cfg.claw.config_file}")
+            click.echo("    The file may be missing or contain invalid JSON.")
+            warnings.append(
+                f"Manually edit {app.cfg.claw.config_file}: "
+                f"set agents.defaults.model.primary to \"{gc.original_model}\" "
+                "and remove the \"litellm\" provider from models.providers"
+            )
+    else:
+        click.echo("  ⚠ No original model on record — cannot revert LLM routing")
+        click.echo("    The model in openclaw.json may still point to litellm/...")
+        warnings.append(
+            f"Check {app.cfg.claw.config_file} and set agents.defaults.model.primary "
+            "to your desired model (e.g. anthropic/claude-sonnet-4-20250514)"
+        )
+
+    # Uninstall OpenClaw plugin
+    openclaw_home = app.cfg.claw.home_dir
+    result = uninstall_openclaw_plugin(openclaw_home)
+    if result == "cli":
+        click.echo("  ✓ OpenClaw plugin uninstalled (via openclaw CLI)")
+    elif result == "manual":
+        click.echo("  ✓ OpenClaw plugin removed from extensions/")
+    elif result == "error":
+        ext_dir = os.path.join(os.path.expanduser(openclaw_home), "extensions", "defenseclaw")
+        click.echo(f"  ✗ Could not remove OpenClaw plugin at {ext_dir}")
+        warnings.append(f"Manually delete: rm -rf {ext_dir}")
+    else:
+        click.echo("  ✓ OpenClaw plugin not installed (nothing to remove)")
 
     gc.enabled = False
-    app.cfg.save()
-    click.echo("  ✓ Config saved")
+    try:
+        app.cfg.save()
+        click.echo("  ✓ Config saved")
+    except OSError as exc:
+        click.echo(f"  ✗ Failed to save config: {exc}")
+        warnings.append("Config not saved — guardrail may re-enable on next run")
+
+    if warnings:
+        click.echo()
+        click.echo("  ── Manual steps required ─────────────────────────────")
+        for w in warnings:
+            click.echo(f"  ⚠ {w}")
 
     if restart:
         click.echo()
         data_dir = os.path.dirname(gc.litellm_config) if gc.litellm_config else os.path.expanduser("~/.defenseclaw")
-        _restart_services(data_dir)
+        _restart_services(data_dir, app.cfg.gateway.host, app.cfg.gateway.port)
     else:
         click.echo()
-        click.echo("  Restart services for changes to take effect:")
+        click.echo("  Restart the defenseclaw sidecar for changes to take effect:")
         click.echo("    defenseclaw-gateway restart")
-        click.echo("    openclaw gateway restart")
+        click.echo("    (openclaw gateway auto-reloads — no restart needed)")
         click.echo()
         click.echo("  Or re-run with --restart:")
         click.echo("    defenseclaw setup guardrail --disable --restart")
@@ -634,18 +849,36 @@ def _print_guardrail_summary(gc, openclaw_config_file: str, *, restart: bool = F
         click.echo(f"    guardrail.{key + ':':<16s} {val}")
     click.echo()
 
-    if not restart:
-        click.echo("  Restart services for changes to take effect:")
-        click.echo("    defenseclaw-gateway restart")
-        click.echo("    openclaw gateway restart")
-        click.echo()
-        click.echo("  Or re-run with --restart:")
-        click.echo("    defenseclaw setup guardrail --restart")
-        click.echo()
 
-    click.echo("  To disable and revert:")
-    click.echo("    defenseclaw setup guardrail --disable")
-    click.echo()
+def _find_plugin_source() -> str | None:
+    """Locate the built OpenClaw plugin.
+
+    Checks the stable staging directory (~/.defenseclaw/extensions/defenseclaw)
+    first — this is where ``make plugin-install`` and future PyPI packaging
+    place the built artifacts.  Falls back to the source tree for dev
+    workflows where the plugin was built but not yet staged.
+    """
+    dc_home = os.path.expanduser("~/.defenseclaw")
+    candidates = [
+        os.path.join(dc_home, "extensions", "defenseclaw"),
+    ]
+
+    # Dev fallback: source tree relative to this file
+    candidates.append(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "extensions", "defenseclaw"),
+    )
+    try:
+        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        repo_root = os.path.dirname(os.path.dirname(pkg_dir))
+        candidates.append(os.path.join(repo_root, "extensions", "defenseclaw"))
+    except Exception:
+        pass
+
+    for c in candidates:
+        resolved = os.path.realpath(c)
+        if os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, "package.json")):
+            return resolved
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -663,13 +896,13 @@ def _is_pid_alive(pid_file: str) -> bool:
         return False
 
 
-def _restart_services(data_dir: str) -> None:
-    """Restart defenseclaw-gateway and openclaw gateway."""
+def _restart_services(data_dir: str, oc_host: str = "127.0.0.1", oc_port: int = 18789) -> None:
+    """Restart defenseclaw-gateway and verify openclaw gateway health."""
     click.echo("  Restarting services...")
     click.echo("  ──────────────────────")
 
     _restart_defense_gateway(data_dir)
-    _restart_openclaw_gateway()
+    _check_openclaw_gateway(oc_host, oc_port)
 
     click.echo()
 
@@ -699,43 +932,95 @@ def _restart_defense_gateway(data_dir: str) -> None:
         click.echo(" ✗ (timed out)")
 
 
-def _restart_openclaw_gateway() -> None:
-    click.echo("  openclaw gateway: checking...", nl=False)
+def _openclaw_gateway_healthy(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Probe the OpenClaw gateway HTTP health endpoint."""
+    import urllib.error
+    import urllib.request
 
+    url = f"http://{host}:{port}/health"
     try:
-        health = subprocess.run(
-            ["openclaw", "gateway", "health"],
-            capture_output=True, text=True, timeout=15,
-        )
-        was_running = health.returncode == 0
-    except FileNotFoundError:
-        click.echo(" skipped (openclaw not found)")
-        return
-    except subprocess.TimeoutExpired:
-        click.echo(" skipped (health check timed out)")
-        return
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
-    if not was_running:
-        click.echo(" not running, skipping")
+
+def _check_openclaw_gateway(host: str = "127.0.0.1", port: int = 18789) -> None:
+    """Verify the OpenClaw gateway remains healthy after a config change.
+
+    OpenClaw watches openclaw.json and auto-restarts on certain changes
+    (e.g. plugins.allow).  A full restart cycle takes ~30s, so a quick
+    health check can give a false positive — the gateway answers, then
+    goes down for the restart.  We therefore:
+
+      1. Wait up to 30s for the gateway to become healthy.
+      2. Keep monitoring for another 30s to make sure it *stays* healthy
+         through any config-triggered restart.
+      3. If it goes unhealthy during that window, wait up to 60s for
+         recovery before giving up.
+    """
+    import time
+
+    initial_wait = 30
+    stable_window = 30
+    recovery_timeout = 60
+    poll_interval = 3
+
+    click.echo("  openclaw gateway: monitoring...", nl=False)
+
+    start = time.monotonic()
+
+    # Phase 1 — wait for initial healthy response
+    healthy = False
+    while time.monotonic() - start < initial_wait:
+        if _openclaw_gateway_healthy(host, port):
+            healthy = True
+            break
+        time.sleep(poll_interval)
+
+    if not healthy:
+        click.echo(" not running")
+        click.echo("    Gateway did not respond within 30s.")
         click.echo("    Start manually: openclaw gateway")
         return
 
-    click.echo(" restarting...", nl=False)
-    try:
-        result = subprocess.run(
-            ["openclaw", "gateway", "restart"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            click.echo(" ✓")
-        else:
-            click.echo(" ✗")
-            err = (result.stderr or result.stdout or "").strip()
-            if err:
-                for line in err.splitlines()[:3]:
-                    click.echo(f"    {line}")
-    except subprocess.TimeoutExpired:
-        click.echo(" ✗ (timed out)")
+    # Phase 2 — confirm stability for stable_window seconds
+    click.echo(" up", nl=False)
+    stable_start = time.monotonic()
+    went_unhealthy = False
+
+    while time.monotonic() - stable_start < stable_window:
+        time.sleep(poll_interval)
+        if not _openclaw_gateway_healthy(host, port):
+            went_unhealthy = True
+            click.echo(" → restarting...", nl=False)
+            break
+
+    if not went_unhealthy:
+        elapsed = int(time.monotonic() - start)
+        click.echo(f" ✓ (healthy, stable for {elapsed}s)")
+        return
+
+    # Phase 3 — gateway went unhealthy (config-triggered restart);
+    #           wait up to recovery_timeout for it to come back
+    recovery_start = time.monotonic()
+    recovered = False
+    while time.monotonic() - recovery_start < recovery_timeout:
+        if _openclaw_gateway_healthy(host, port):
+            recovered = True
+            break
+        time.sleep(poll_interval)
+
+    if recovered:
+        elapsed = int(time.monotonic() - start)
+        click.echo(f" ✓ (recovered after restart, {elapsed}s)")
+    else:
+        elapsed = int(time.monotonic() - start)
+        click.echo(f" ✗ (unhealthy after {elapsed}s)")
+        click.echo("    Gateway did not recover after config-triggered restart.")
+        click.echo("    Check: openclaw gateway status")
+        click.echo("    Logs: ~/.openclaw/logs/gateway.err.log")
 
 
 def _looks_like_secret(value: str) -> bool:

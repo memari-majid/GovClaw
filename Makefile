@@ -4,14 +4,47 @@ VERSION     := 0.2.0
 GOFLAGS     := -ldflags "-X main.version=$(VERSION)"
 VENV        := .venv
 INSTALL_DIR := $(HOME)/.local/bin
+PLUGIN_DIR  := extensions/defenseclaw
+DC_EXT_DIR  := $(HOME)/.defenseclaw/extensions/defenseclaw
 
-.PHONY: dev-install pycli gateway gateway-install test cli-test gateway-test test-verbose test-file lint clean
+.PHONY: build install dev-install pycli gateway gateway-run gateway-install \
+        plugin plugin-install test cli-test gateway-test test-verbose test-file lint clean
+
+# ---------------------------------------------------------------------------
+# Aggregate targets
+# ---------------------------------------------------------------------------
+
+build: pycli gateway plugin
+	@echo ""
+	@echo "All components built:"
+	@echo "  • Python CLI   → $(VENV)/bin/defenseclaw"
+	@echo "  • Go gateway   → ./$(GATEWAY)"
+	@echo "  • OpenClaw plugin → $(PLUGIN_DIR)/dist/"
+	@echo ""
+	@echo "Run 'make install' to install all components."
+
+install: pycli gateway-install plugin-install
+	@echo ""
+	@echo "All components installed:"
+	@echo "  • Python CLI   → $(VENV)/bin/defenseclaw  (activate with: source $(VENV)/bin/activate)"
+	@echo "  • Go gateway   → $(INSTALL_DIR)/$(GATEWAY)"
+	@echo "  • OpenClaw plugin → ~/.defenseclaw/extensions/defenseclaw/"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  source $(VENV)/bin/activate"
+	@echo "  defenseclaw init"
+	@echo "  defenseclaw setup guardrail   # configure LLM guardrail"
+
+# ---------------------------------------------------------------------------
+# Individual build targets
+# ---------------------------------------------------------------------------
 
 dev-install:
 	@./scripts/install-dev.sh
 
 pycli:
 	@command -v uv >/dev/null 2>&1 || { echo "uv not found — install from https://docs.astral.sh/uv/"; exit 1; }
+	@find cli/ -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	uv venv $(VENV) --python 3.12
 	uv pip install -e . --python $(VENV)/bin/python
 	@echo ""
@@ -28,10 +61,20 @@ gateway:
 gateway-run: gateway
 	./$(GATEWAY)
 
+plugin:
+	@command -v npm >/dev/null 2>&1 || { echo "npm not found — install Node.js from https://nodejs.org/"; exit 1; }
+	cd $(PLUGIN_DIR) && npm install && npm run build
+	@echo ""
+	@echo "Built OpenClaw plugin → $(PLUGIN_DIR)/dist/"
+	@echo "  Install with: make plugin-install"
+
+# ---------------------------------------------------------------------------
+# Individual install targets
+# ---------------------------------------------------------------------------
+
 gateway-install: gateway
 	@mkdir -p $(INSTALL_DIR)
 	@cp $(GATEWAY) $(INSTALL_DIR)/$(GATEWAY)
-	@# Re-sign on macOS (copying invalidates adhoc signature)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign -f -s - $(INSTALL_DIR)/$(GATEWAY) 2>/dev/null || true; \
 	fi
@@ -41,6 +84,31 @@ gateway-install: gateway
 		echo "Add $(INSTALL_DIR) to your PATH:"; \
 		echo "  export PATH=\"$(INSTALL_DIR):\$$PATH\""; \
 	fi
+
+plugin-install: plugin
+	@if [ ! -f $(PLUGIN_DIR)/dist/index.js ]; then \
+		echo "Plugin not built — run 'make plugin' first"; \
+		exit 1; \
+	fi
+	@rm -rf $(DC_EXT_DIR)
+	@mkdir -p $(DC_EXT_DIR)
+	@cp $(PLUGIN_DIR)/package.json $(DC_EXT_DIR)/
+	@test -f $(PLUGIN_DIR)/openclaw.plugin.json && cp $(PLUGIN_DIR)/openclaw.plugin.json $(DC_EXT_DIR)/ || true
+	@cp -r $(PLUGIN_DIR)/dist $(DC_EXT_DIR)/
+	@if [ -d $(PLUGIN_DIR)/node_modules ]; then \
+		mkdir -p $(DC_EXT_DIR)/node_modules; \
+		for dep in js-yaml argparse; do \
+			if [ -d $(PLUGIN_DIR)/node_modules/$$dep ]; then \
+				cp -r $(PLUGIN_DIR)/node_modules/$$dep $(DC_EXT_DIR)/node_modules/; \
+			fi; \
+		done; \
+	fi
+	@echo "Installed OpenClaw plugin to $(DC_EXT_DIR)"
+	@echo "  Run 'defenseclaw setup guardrail' to register with OpenClaw"
+
+# ---------------------------------------------------------------------------
+# Test targets
+# ---------------------------------------------------------------------------
 
 test: cli-test gateway-test
 
@@ -62,4 +130,5 @@ lint:
 
 clean:
 	rm -f $(GATEWAY) $(GATEWAY)-*
-	rm -rf $(VENV) cli/*.egg-info cli/defenseclaw/__pycache__ cli/defenseclaw/**/__pycache__
+	rm -rf $(VENV) cli/*.egg-info
+	find cli/ -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

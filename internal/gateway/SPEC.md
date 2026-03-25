@@ -278,18 +278,8 @@ Managed via the Python CLI:
 The API server binds to `127.0.0.1:{gateway.api_port}` (localhost only).
 All responses are `application/json`.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Subsystem health snapshot (gateway, watcher, API states + uptime) |
-| `/status` | GET | Health snapshot + gateway hello payload (if connected) |
-| `/skill/disable` | POST | Disable a skill at the gateway. Body: `{ "skillKey": "..." }` |
-| `/skill/enable` | POST | Enable a skill at the gateway. Body: `{ "skillKey": "..." }` |
-| `/config/patch` | POST | Patch gateway config. Body: `{ "path": "...", "value": ... }` |
-
-Skill and config endpoints proxy RPCs through the connected gateway client.
-If the gateway is not connected, they return `503 Service Unavailable`. If
-the gateway rejects the RPC, they return `502 Bad Gateway`. All mutations
-are logged to the audit store.
+For the full endpoint reference with request/response schemas, callers,
+and code flow diagrams, see **[docs/API.md](../../docs/API.md)**.
 
 ## Health Tracking
 

