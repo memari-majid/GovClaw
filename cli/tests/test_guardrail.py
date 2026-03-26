@@ -1482,15 +1482,17 @@ class TestDisableGuardrailFlow(unittest.TestCase):
         self.assertIn("Manually edit", result.output)
 
     def test_uninstalls_plugin_during_disable(self):
+        from unittest.mock import patch
         from defenseclaw.commands.cmd_setup import setup
         ext = os.path.join(self.tmp_dir, "extensions", "defenseclaw")
         os.makedirs(ext)
         with open(os.path.join(ext, "index.js"), "w") as f:
             f.write("// plugin")
 
-        result = self.runner.invoke(
-            setup, ["guardrail", "--disable"], obj=self.app,
-        )
+        with patch("defenseclaw.guardrail.subprocess.run", side_effect=FileNotFoundError):
+            result = self.runner.invoke(
+                setup, ["guardrail", "--disable"], obj=self.app,
+            )
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("plugin removed from extensions", result.output)
         self.assertFalse(os.path.exists(ext))
