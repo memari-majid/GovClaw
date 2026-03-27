@@ -13,9 +13,10 @@ Source: `internal/gateway/api.go`, `internal/gateway/inspect.go`
 
 | Endpoint | Method | Purpose | Callers |
 |----------|--------|---------|---------|
-| `/health` | GET | Sidecar health check | Python CLI (`gateway.py`, `cmd_sidecar.py`, `cmd_status.py`), Go CLI (`sidecar.go`) |
-| `/status` | GET | Full sidecar status + gateway hello | No production callers |
+| `/health` | GET | Sidecar health check | Python CLI (`gateway.py`, `cmd_status.py`, `cmd_init.py`, `cmd_doctor.py`), Go CLI (`sidecar.go`) |
+| `/status` | GET | Full sidecar status + gateway hello | TS plugin (`DaemonClient.status()` in `client.ts`), Python CLI (`OrchestratorClient.status()` in `gateway.py`) — no CLI command calls it directly |
 | `/api/v1/inspect/tool` | POST | **Inspect tool call before execution** | OpenClaw plugin `before_tool_call` hook (`index.ts`) |
+| `/api/v1/scan/code` | POST | **Run CodeGuard scanner on a file/directory** | TS plugin `runCodeScan()` (`enforcer.ts`), CodeGuard skill (`main.py`) |
 | `/v1/guardrail/event` | POST | Receive verdict telemetry from LiteLLM guardrail | Python guardrail (`defenseclaw_guardrail.py`) |
 | `/v1/guardrail/evaluate` | POST | OPA policy evaluation for guardrail verdicts | Python guardrail (`defenseclaw_guardrail.py`) |
 | `/v1/guardrail/config` | GET/PATCH | Read/update guardrail mode at runtime | No production callers |
@@ -24,16 +25,24 @@ Source: `internal/gateway/api.go`, `internal/gateway/inspect.go`
 | `/enforce/blocked` | GET | List all blocked entries | TS plugin `syncFromDaemon()` (`enforcer.ts`) |
 | `/enforce/allowed` | GET | List all allowed entries | TS plugin `syncFromDaemon()` (`enforcer.ts`) |
 | `/policy/evaluate` | POST | Admission gate evaluation (block→allow→scan) | TS plugin `evaluateViaOPA()` (`enforcer.ts`) |
+| `/policy/evaluate/firewall` | POST | OPA firewall policy evaluation | No production callers |
+| `/policy/evaluate/sandbox` | POST | OPA sandbox policy evaluation | No production callers |
+| `/policy/evaluate/audit` | POST | OPA audit retention policy evaluation | No production callers |
+| `/policy/evaluate/skill-actions` | POST | OPA skill-actions policy evaluation | No production callers |
+| `/policy/reload` | POST | Reload OPA policy engine from disk | No production callers |
 | `/scan/result` | POST | Store scan result in audit log | TS plugin (`enforcer.ts`, `client.ts`) |
 | `/v1/skill/scan` | POST | Run skill scanner on a local path | Python CLI (`gateway.py`, `cmd_skill.py`) |
+| `/v1/mcp/scan` | POST | Run MCP scanner on a local path | No production callers |
 | `/v1/skill/fetch` | POST | Stream skill directory as tar.gz | No production callers |
 | `/skill/disable` | POST | Disable skill via OpenClaw WS | Python CLI (`cmd_skill.py`), sidecar watcher |
 | `/skill/enable` | POST | Enable skill via OpenClaw WS | Python CLI (`cmd_skill.py`) |
+| `/plugin/disable` | POST | Disable plugin via OpenClaw WS | Python CLI (`cmd_plugin.py`) |
+| `/plugin/enable` | POST | Enable plugin via OpenClaw WS | Python CLI (`cmd_plugin.py`) |
 | `/config/patch` | POST | Patch OpenClaw config via WS | No production callers |
 | `/skills` | GET | List skills from OpenClaw | Python CLI (`cmd_skill.py`) |
-| `/mcps` | GET | List MCP servers from config dirs | No production callers |
+| `/mcps` | GET | List MCP servers from config dirs | TS plugin (`DaemonClient.listMCPs()` in `client.ts`) — no CLI command calls it directly |
 | `/tools/catalog` | GET | Tool catalog from OpenClaw | No production callers |
-| `/alerts` | GET | Recent alerts from audit store | No production callers (TUI uses SQLite directly) |
+| `/alerts` | GET | Recent alerts from audit store | TS plugin (`DaemonClient.listAlerts()` in `client.ts`) — TUI uses SQLite directly |
 | `/audit/event` | POST | Log arbitrary audit event | TS plugin (`enforcer.ts`, `client.ts`) |
 
 ---
@@ -45,6 +54,7 @@ Source: `internal/gateway/api.go`, `internal/gateway/inspect.go`
 - [Guardrail (LiteLLM)](#guardrail-litellm)
 - [Enforcement (Block/Allow)](#enforcement-blockallow)
 - [Admission Policy](#admission-policy)
+- [Policy Domains (OPA)](#policy-domains-opa)
 - [Scanning](#scanning)
 - [Gateway Operations](#gateway-operations)
 - [Audit](#audit)
@@ -59,9 +69,10 @@ Returns the subsystem health snapshot (gateway, watcher, API, guardrail
 states + uptime).
 
 **Callers:**
-- Python CLI: `OrchestratorClient.health()` in `cli/defenseclaw/gateway.py`
-- `defenseclaw sidecar status` command (`cli/defenseclaw/commands/cmd_sidecar.py`)
+- Python CLI: `OrchestratorClient.health()` / `is_running()` in `cli/defenseclaw/gateway.py`
 - `defenseclaw status` command (`cli/defenseclaw/commands/cmd_status.py`) via `is_running()`
+- `defenseclaw init` command (`cli/defenseclaw/commands/cmd_init.py`) via `_check_sidecar_health()`
+- `defenseclaw doctor` command (`cli/defenseclaw/commands/cmd_doctor.py`) via `_check_sidecar()`
 - Go CLI: `internal/cli/sidecar.go` for sidecar health probe
 
 **Response:**
@@ -81,8 +92,11 @@ states + uptime).
 Returns the health snapshot plus the gateway hello payload (protocol
 version, features, auth) if connected.
 
-**Callers:** Client method exists (`OrchestratorClient.status()`,
-`DaemonClient.status()`) but no production command calls it directly.
+**Callers:**
+- TS plugin: `DaemonClient.status()` in `extensions/defenseclaw/src/client.ts`
+- Python CLI: `OrchestratorClient.status()` in `cli/defenseclaw/gateway.py`
+
+No production CLI command calls this directly.
 
 **Response:**
 
@@ -402,6 +416,177 @@ PolicyEnforcer.evaluateSkill() / evaluateMCPServer() / evaluatePlugin()
 
 ---
 
+## Policy Domains (OPA)
+
+These endpoints evaluate inputs against specific OPA policy domains.
+They share the same pattern: load the policy engine from
+`scannerCfg.PolicyDir`, evaluate the domain-specific input, and return
+the policy output. All return `503` if the policy engine cannot be
+loaded and `500` if evaluation fails.
+
+Source: `internal/gateway/api.go`, `internal/policy/types.go`
+
+### POST /policy/evaluate/firewall
+
+Evaluate a network destination against firewall policy rules.
+
+**Callers:** No production callers currently. Available for
+programmatic firewall policy checks.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `target_type` | string | no | Target type label |
+| `destination` | string | yes | Network destination (hostname or IP) |
+| `port` | int | no | Destination port |
+| `protocol` | string | no | Protocol (`tcp`, `udp`, etc.) |
+
+```json
+{
+  "destination": "evil.example.com",
+  "port": 443,
+  "protocol": "tcp"
+}
+```
+
+**Response:**
+
+```json
+{
+  "action": "block",
+  "rule_name": "deny-untrusted-hosts"
+}
+```
+
+### POST /policy/evaluate/sandbox
+
+Evaluate a skill's requested endpoints and permissions against sandbox
+policy rules.
+
+**Callers:** No production callers currently. Available for
+programmatic sandbox policy checks.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `skill_name` | string | yes | Name of the skill |
+| `requested_endpoints` | string[] | no | Network endpoints the skill wants to access |
+| `requested_permissions` | string[] | no | OS permissions the skill wants |
+
+```json
+{
+  "skill_name": "web-search",
+  "requested_endpoints": ["https://api.example.com"],
+  "requested_permissions": ["network", "filesystem"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "allowed_endpoints": ["https://api.example.com"],
+  "denied_endpoints": [],
+  "denied_from_request": [],
+  "permissions": ["network"],
+  "allowed_skills": ["web-search"]
+}
+```
+
+### POST /policy/evaluate/audit
+
+Evaluate an audit event against retention and export policy rules.
+
+**Callers:** No production callers currently. Available for
+programmatic audit policy checks.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `event_type` | string | no | Type of audit event |
+| `severity` | string | no | Event severity |
+| `age_days` | int | no | Age of the event in days |
+| `export_targets` | string[] | no | Candidate export destinations |
+
+```json
+{
+  "event_type": "scan.complete",
+  "severity": "HIGH",
+  "age_days": 30,
+  "export_targets": ["splunk"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "retain": true,
+  "retain_reason": "severity HIGH within retention window",
+  "export_to": ["splunk"]
+}
+```
+
+### POST /policy/evaluate/skill-actions
+
+Evaluate what runtime, file, and install actions should apply for a
+given severity level. Used to determine enforcement behavior.
+
+**Callers:** No production callers currently. Available for
+programmatic skill-action policy lookups.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `severity` | string | yes | Severity level (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`) |
+| `target_type` | string | no | Target type (`skill`, `mcp`, `plugin`) |
+
+```json
+{
+  "severity": "HIGH",
+  "target_type": "skill"
+}
+```
+
+**Response:**
+
+```json
+{
+  "runtime_action": "disable",
+  "file_action": "quarantine",
+  "install_action": "block",
+  "should_block": true
+}
+```
+
+### POST /policy/reload
+
+Reload the OPA policy engine from the configured `policy_dir`. Useful
+after editing Rego policy files on disk to pick up changes without
+restarting the sidecar.
+
+**Callers:** No production callers currently.
+
+**Request:** No request body.
+
+**Response:**
+
+```json
+{
+  "status": "reloaded",
+  "policy_dir": "/Users/you/.defenseclaw/policies"
+}
+```
+
+**Errors:** `503` if `policy_dir` is not configured, `500` if engine
+creation fails, `400` if policy compilation fails.
+
+---
+
 ## Scanning
 
 ### POST /scan/result
@@ -442,6 +627,70 @@ defenseclaw scan /path/to/skill --remote
 |-------|------|----------|-------------|
 | `target` | string | yes | Absolute path to skill directory |
 | `name` | string | no | Skill name (for logging) |
+
+### POST /v1/mcp/scan
+
+Run the Python `mcp-scanner` CLI on a local directory path. Returns
+the scan result. Analogous to `/v1/skill/scan` but for MCP server
+configs.
+
+**Callers:** No production callers currently. Available for
+programmatic MCP config scanning.
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `target` | string | yes | Absolute path to MCP config directory |
+| `name` | string | no | MCP server name (for logging) |
+
+```json
+{
+  "target": "/Users/you/.openclaw/mcp/my-server",
+  "name": "my-server"
+}
+```
+
+**Response:** Same `ScanResult` JSON as `/v1/skill/scan`.
+
+Source: `internal/gateway/api.go` (`handleMCPScan`)
+
+### POST /api/v1/scan/code
+
+Run the CodeGuard scanner (built-in regex rule engine) on a file or
+directory. Returns findings for secrets, dangerous patterns, and code
+quality issues.
+
+**Callers:**
+- TS plugin: `runCodeScan()` in `extensions/defenseclaw/src/policy/enforcer.ts`
+- CodeGuard skill: `_scan_via_sidecar()` in `cli/defenseclaw/_data/skills/codeguard/main.py`
+
+**Code flow:**
+
+```
+TS plugin or CodeGuard skill
+  → POST /api/v1/scan/code { "path": "/some/file.py" }
+    → api.go handleCodeScan()
+      → scanner.NewCodeGuardScanner(rulesDir).Scan(ctx, path)
+      → optional audit: LogScan()
+    → returns ScanResult JSON
+```
+
+**Request:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | string | yes | Absolute path to file or directory to scan |
+
+```json
+{
+  "path": "/Users/you/project/src/app.py"
+}
+```
+
+**Response:** Same `ScanResult` JSON as `/v1/skill/scan`.
+
+Source: `internal/gateway/api.go` (`handleCodeScan`)
 
 ### POST /v1/skill/fetch
 
@@ -494,6 +743,47 @@ Enable a previously disabled skill at the OpenClaw gateway.
 
 ```json
 { "skillKey": "my-skill-name" }
+```
+
+### POST /plugin/disable
+
+Disable a plugin at the OpenClaw gateway via WebSocket RPC.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.disable_plugin()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw plugin disable` command in `cli/defenseclaw/commands/cmd_plugin.py`
+
+**Request:**
+
+```json
+{ "pluginName": "my-plugin" }
+```
+
+**Response:**
+
+```json
+{ "status": "disabled", "pluginName": "my-plugin" }
+```
+
+### POST /plugin/enable
+
+Enable a previously disabled plugin at the OpenClaw gateway via
+WebSocket RPC.
+
+**Callers:**
+- Python CLI: `OrchestratorClient.enable_plugin()` in `cli/defenseclaw/gateway.py`
+- `defenseclaw plugin enable` command in `cli/defenseclaw/commands/cmd_plugin.py`
+
+**Request:**
+
+```json
+{ "pluginName": "my-plugin" }
+```
+
+**Response:**
+
+```json
+{ "status": "enabled", "pluginName": "my-plugin" }
 ```
 
 ### POST /config/patch
@@ -560,8 +850,11 @@ Log an arbitrary audit event to the SQLite store.
 
 List recent alerts from the audit store, ordered by most recent.
 
-**Callers:** No production HTTP callers. The TUI and CLI access the
-SQLite audit store directly via the Go `audit.Store` package.
+**Callers:**
+- TS plugin: `DaemonClient.listAlerts()` in `client.ts`
+
+The TUI and CLI access the SQLite audit store directly via the Go
+`audit.Store` package rather than this HTTP endpoint.
 
 **Query params:**
 

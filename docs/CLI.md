@@ -1,18 +1,36 @@
 # CLI Reference
 
-All subcommands are registered on `defenseclaw`. Use `defenseclaw <command> --help` for flags and examples.
+DefenseClaw has two CLI binaries:
 
-## Commands
+| Binary | Language | Install |
+|--------|----------|---------|
+| `defenseclaw` | Python (Click) | `make pycli` or `uv pip install -e .` |
+| `defenseclaw-gateway` | Go (Cobra) | `make gateway` |
+
+Use `<binary> --help` for any command.
+
+---
+
+## Python CLI (`defenseclaw`)
+
+### Top-Level Commands
 
 | Command | Description |
 |---------|-------------|
-| `init` | Create `~/.defenseclaw` config, SQLite audit database, and install scanner dependencies |
-| `setup skill-scanner` | Interactively configure skill-scanner analyzers, API keys, and policy |
-| `deploy [path]` | Full orchestrated deploy: init → scan → block → policy → sandbox |
-| `sidecar` | Show gateway sidecar info and startup instructions |
-| `sidecar status` | Show health of the running sidecar's subsystems |
-| `status` | Show environment, sandbox health, scanner availability, and enforcement counts |
+| `init` | Create `~/.defenseclaw` config, SQLite audit database, install scanner deps |
+| `status` | Show environment, scanner availability, enforcement counts, sidecar health |
 | `alerts` | Show recent security alerts |
+| `doctor` | Verify credentials, endpoints, and connectivity after setup |
+
+### setup
+
+| Command | Description |
+|---------|-------------|
+| `setup skill-scanner` | Configure skill-scanner analyzers, API keys, and policy |
+| `setup mcp-scanner` | Configure MCP scanner analyzers |
+| `setup gateway` | Configure gateway connection settings |
+| `setup guardrail` | Configure LLM guardrail (mode, model, port, API key) |
+| `setup splunk` | Configure Splunk HEC / OTLP / local bridge integration |
 
 ### skill
 
@@ -20,7 +38,7 @@ All subcommands are registered on `defenseclaw`. Use `defenseclaw <command> --he
 |---------|-------------|
 | `skill list` | List all OpenClaw skills with scan severity and enforcement status |
 | `skill scan <target>` | Scan a skill by name, path, or `all` for all configured skills |
-| `skill install <name>` | Install via clawhub → scan → enforce block/allow list |
+| `skill install <name>` | Install via clawhub, scan, enforce block/allow list |
 | `skill info <name>` | Show detailed skill metadata, scan results, and enforcement actions |
 | `skill block <name>` | Add a skill to the block list |
 | `skill allow <name>` | Add a skill to the allow list (removes from block list) |
@@ -44,18 +62,85 @@ All subcommands are registered on `defenseclaw`. Use `defenseclaw <command> --he
 |---------|-------------|
 | `plugin list` | List installed plugins |
 | `plugin scan <name-or-path>` | Scan a plugin for security issues |
-| `plugin install <name-or-path>` | Install a plugin from a local path or registry |
+| `plugin install <name-or-path>` | Install a plugin from a local path |
 | `plugin remove <name>` | Remove an installed plugin |
+
+### tool
+
+| Command | Description |
+|---------|-------------|
+| `tool block <name>` | Block a tool (global or scoped with `--source`) |
+| `tool allow <name>` | Allow a tool (skip scan gate) |
+| `tool unblock <name>` | Remove a tool from the block/allow list |
+| `tool list` | List tools in the block/allow list |
+| `tool status <name>` | Show block/allow status of a tool |
+
+### policy
+
+| Command | Description |
+|---------|-------------|
+| `policy create <name>` | Create a new security policy |
+| `policy list` | List all available policies (built-in and custom) |
+| `policy show <name>` | Show details of a policy |
+| `policy activate <name>` | Activate a policy (applies to config + OPA data.json) |
+| `policy delete <name>` | Delete a custom policy |
+| `policy validate` | Compile-check Rego modules and validate data.json |
+| `policy test` | Run OPA Rego unit tests |
+| `policy edit actions` | Edit severity-to-action mappings |
+| `policy edit scanner` | Edit per-scanner action overrides |
+| `policy edit guardrail` | Edit guardrail policy (thresholds, Cisco trust, patterns) |
+| `policy edit firewall` | Edit firewall policy (domains, ports, blocklists) |
 
 ### aibom
 
 | Command | Description |
 |---------|-------------|
-| `aibom generate [path]` | Generate AI Bill of Materials for a project |
+| `aibom scan [path]` | Generate AI Bill of Materials for a project |
+
+### codeguard
+
+| Command | Description |
+|---------|-------------|
+| `codeguard install-skill` | Install the CodeGuard skill into the OpenClaw workspace |
 
 ---
 
-## init
+## Go Gateway CLI (`defenseclaw-gateway`)
+
+The Go binary runs the sidecar daemon and provides additional commands.
+
+### Daemon
+
+| Command | Description |
+|---------|-------------|
+| *(no subcommand)* | Run the sidecar in the foreground |
+| `start` | Start the sidecar as a background daemon |
+| `stop` | Stop the running daemon |
+| `restart` | Restart the daemon |
+| `status` | Show health of the running sidecar's subsystems |
+
+### scan
+
+| Command | Description |
+|---------|-------------|
+| `scan code <path>` | Scan source code with CodeGuard static analyzer |
+
+### policy
+
+| Command | Description |
+|---------|-------------|
+| `policy validate` | Compile-check Rego modules and validate data.json |
+| `policy show` | Display current OPA data.json policy |
+| `policy evaluate` | Dry-run admission policy for a given input |
+| `policy evaluate-firewall` | Dry-run firewall policy for a given destination |
+| `policy reload` | Tell the running sidecar to hot-reload OPA policies |
+| `policy domains` | List firewall domain allowlist and blocklist |
+
+---
+
+## Command Details
+
+### init
 
 ```
 defenseclaw init [flags]
@@ -67,7 +152,7 @@ and installs scanner dependencies (skill-scanner, mcp-scanner, cisco-aibom) via 
 **Flags:**
 - `--skip-install` — skip automatic scanner dependency installation
 
-## setup skill-scanner
+### setup skill-scanner
 
 ```
 defenseclaw setup skill-scanner [flags]
@@ -93,37 +178,24 @@ environment variables when skill-scanner runs.
 - `--lenient` — tolerate malformed skills
 - `--non-interactive` — use flags instead of prompts (for CI)
 
-## deploy
+### setup guardrail
 
 ```
-defenseclaw deploy [path] [flags]
+defenseclaw setup guardrail [flags]
 ```
 
-Full orchestrated deployment:
-1. Initialize if needed
-2. Run all scanners (skills + MCP + AIBOM)
-3. Auto-block anything HIGH/CRITICAL
-4. Generate OpenShell sandbox policy
-5. Start sandbox
-6. Print summary
+Configure the LLM guardrail (LiteLLM proxy + inspection module). See
+[Guardrail Quick Start](GUARDRAIL_QUICKSTART.md) for a full walkthrough.
 
 **Flags:**
-- `--skip-init` — skip initialization step
+- `--mode` — `observe` (log only) or `action` (block threats)
+- `--scanner-mode` — `local`, `remote`, or `both`
+- `--port` — LiteLLM proxy port (default: 4000)
+- `--disable` — disable guardrail and revert openclaw.json
+- `--restart` — restart sidecar + OpenClaw after configuration
+- `--non-interactive` — use flags instead of prompts
 
-## skill list
-
-```
-defenseclaw skill list [flags]
-```
-
-Lists all OpenClaw skills with their latest scan severity, enforcement status,
-and applied actions. Merges data from OpenClaw's skill registry with DefenseClaw's
-audit database.
-
-**Flags:**
-- `--json` — output merged skill list as JSON
-
-## skill scan
+### skill scan
 
 ```
 defenseclaw skill scan <target> [flags]
@@ -135,21 +207,17 @@ block/allow lists — blocked skills are rejected, allowed skills skip scan.
 **Flags:**
 - `--json` — output scan results as JSON
 - `--path` — override skill directory path
+- `--remote` — run scan via the Go sidecar REST API
 
 **Examples:**
 
 ```bash
-# Scan a skill by name (resolved via openclaw)
 defenseclaw skill scan web-search
-
-# Scan a skill by path
 defenseclaw skill scan ./my-skill --path ./my-skill
-
-# Scan all configured skills
 defenseclaw skill scan all
 ```
 
-## skill install
+### skill install
 
 ```
 defenseclaw skill install <name> [flags]
@@ -160,236 +228,71 @@ Follows the admission gate: block list → allow list → scan → enforce.
 
 **Flags:**
 - `--force` — overwrite an existing skill
-- `--action` — apply configured `skill_actions` policy based on scan severity (quarantine, disable, block)
+- `--action` — apply configured `skill_actions` policy based on scan severity
 
-## skill info
-
-```
-defenseclaw skill info <name> [flags]
-```
-
-Shows merged skill metadata from OpenClaw, latest scan results, and enforcement actions.
-
-**Flags:**
-- `--json` — output as JSON
-
-## skill block
+### skill block / allow
 
 ```
-defenseclaw skill block <name> [flags]
+defenseclaw skill block <name> [--reason "..."]
+defenseclaw skill allow <name> [--reason "..."]
 ```
 
-Adds a skill to the install block list. Blocked skills are rejected by
-`skill install` before any scan runs.
-
-**Flags:**
-- `--reason` — reason for blocking
-
-## skill allow
+### skill disable / enable
 
 ```
-defenseclaw skill allow <name> [flags]
-```
-
-Adds a skill to the allow list. Allow-listed skills skip the scan gate
-during install. Also removes the skill from the block list.
-
-**Flags:**
-- `--reason` — reason for allowing
-
-## skill disable
-
-```
-defenseclaw skill disable <name> [flags]
-```
-
-Disables a skill at runtime via OpenClaw gateway RPC. Prevents the agent
-from using the skill's tools until re-enabled. Requires the sidecar to be running.
-
-**Flags:**
-- `--reason` — reason for disabling
-
-## skill enable
-
-```
+defenseclaw skill disable <name> [--reason "..."]
 defenseclaw skill enable <name>
 ```
 
-Re-enables a previously disabled skill via gateway RPC.
+Requires the sidecar to be running. Sends RPC to OpenClaw gateway.
 
-## skill quarantine
-
-```
-defenseclaw skill quarantine <name> [flags]
-```
-
-Moves the skill's directory to `~/.defenseclaw/quarantine/skills/` and records
-the action. Use `skill restore` to undo.
-
-**Flags:**
-- `--reason` — reason for quarantine
-
-## skill restore
+### skill quarantine / restore
 
 ```
-defenseclaw skill restore <name> [flags]
+defenseclaw skill quarantine <name> [--reason "..."]
+defenseclaw skill restore <name> [--path /override/path]
 ```
 
-Restores a quarantined skill to its original location.
-
-**Flags:**
-- `--path` — override restore destination (defaults to original path)
-
-## mcp list
+### mcp scan
 
 ```
-defenseclaw mcp list
+defenseclaw mcp scan <url> [--json]
 ```
 
-Lists MCP servers with their enforcement status (blocked, allowed), reason,
-and last update time.
-
-## mcp scan
+### plugin scan
 
 ```
-defenseclaw mcp scan <url> [flags]
+defenseclaw plugin scan <name-or-path> [--json]
 ```
 
-Scans an MCP server endpoint using cisco-ai-mcp-scanner.
-
-**Flags:**
-- `--json` — output results as JSON
-
-## mcp block
+### aibom scan
 
 ```
-defenseclaw mcp block <url> [flags]
+defenseclaw aibom scan [path] [--json] [--summary-only] [--categories "..."]
 ```
 
-Adds an MCP server to the block list.
-
-**Flags:**
-- `--reason` — reason for blocking
-
-## mcp allow
-
-```
-defenseclaw mcp allow <url> [flags]
-```
-
-Adds an MCP server to the allow list.
-
-**Flags:**
-- `--reason` — reason for allowing
-
-## plugin list
-
-```
-defenseclaw plugin list
-```
-
-Lists installed plugins from `~/.defenseclaw/plugins/`.
-
-## plugin scan
-
-```
-defenseclaw plugin scan <name-or-path> [flags]
-```
-
-Scans a plugin directory for security issues. Checks for dangerous permissions,
-install scripts, credential theft, obfuscation, supply chain risks, and more.
-
-Accepts a plugin name (resolved from `~/.defenseclaw/plugins/`) or a direct path.
-
-**Flags:**
-- `--json` — output scan results as JSON
-
-**Examples:**
-
-```bash
-# Scan an installed plugin by name
-defenseclaw plugin scan my-plugin
-
-# Scan a plugin directory
-defenseclaw plugin scan /path/to/plugin
-```
-
-## plugin install
-
-```
-defenseclaw plugin install <name-or-path>
-```
-
-Installs a plugin from a local directory path. Copies the plugin directory
-to `~/.defenseclaw/plugins/`.
-
-## plugin remove
-
-```
-defenseclaw plugin remove <name>
-```
-
-Removes an installed plugin by name.
-
-## aibom generate
-
-```
-defenseclaw aibom generate [path] [flags]
-```
-
-Generates an AI Bill of Materials for a project. Runs cisco-aibom to inventory
-AI components, models, and dependencies.
-
-**Flags:**
-- `--json` — output results as JSON
-
-**Examples:**
-
-```bash
-# Generate AIBOM for current directory
-defenseclaw aibom generate
-
-# Generate AIBOM for a specific project
-defenseclaw aibom generate /path/to/project
-
-# Output as JSON for pipeline integration
-defenseclaw aibom generate --json
-```
-
-## sidecar
-
-```
-defenseclaw sidecar
-```
-
-Displays gateway sidecar configuration and startup instructions.
-The sidecar daemon runs as a separate Go binary (`defenseclaw-go`).
-
-## sidecar status
-
-```
-defenseclaw sidecar status
-```
-
-Queries the sidecar's REST API to display the health of all three subsystems:
-gateway connection, skill watcher, and API server.
-
-## status
+### status
 
 ```
 defenseclaw status
 ```
 
-Shows environment, data directory, sandbox state, scanner availability,
+Shows environment, data directory, scanner availability,
 enforcement counts, activity summary, and sidecar status.
 
-## alerts
+### alerts
 
 ```
 defenseclaw alerts [-n limit]
 ```
 
-Displays recent security alerts (events with severity CRITICAL, HIGH, MEDIUM, or LOW).
+Displays recent security alerts. Default limit: 25.
 
-**Flags:**
-- `-n, --limit` — number of alerts to show (default: 25)
+### doctor
+
+```
+defenseclaw doctor [--json]
+```
+
+Runs connectivity and credential checks against all configured services
+(sidecar, LiteLLM, Cisco AI Defense, Splunk, scanners).

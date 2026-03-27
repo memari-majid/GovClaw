@@ -6,9 +6,14 @@ DefenseClaw is the enterprise governance layer for [OpenClaw](https://github.com
 
 - [Installation Guide](INSTALL.md) — DGX Spark + macOS, existing or fresh OpenClaw
 - [Quick Start Guide](QUICKSTART.md) — 5-minute walkthrough of all commands
-- [Architecture](ARCHITECTURE.md)
-- [CLI Reference](CLI.md)
-- [TUI Guide](TUI.md)
-- [Plugin Development](PLUGINS.md)
-- [Testing](TESTING.md)
+- [Architecture](ARCHITECTURE.md) — system diagram, data flow, component responsibilities
+- [CLI Reference](CLI.md) — all Python CLI commands and flags
+- [API Reference](API.md) — Go sidecar REST API endpoints
+- [LLM Guardrail](GUARDRAIL.md) — guardrail data flow and configuration
+- [Guardrail Quick Start](GUARDRAIL_QUICKSTART.md) — set up and test the LLM guardrail
+- [TUI Guide](TUI.md) — dashboard usage, keybindings, navigation
+- [OpenTelemetry](OTEL.md) — OTEL signal spec, Splunk mapping
+- [Config Files](CONFIG_FILES.md) — config files and environment variables
+- [Plugin Development](PLUGINS.md) — custom scanner plugin interface
+- [Testing](TESTING.md) — multi-language test guide (Python, Go, TypeScript, Rego)
 - [Contributing](CONTRIBUTING.md)

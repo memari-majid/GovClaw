@@ -1,6 +1,6 @@
 # Contributing to DefenseClaw
 
-Thank you for helping improve DefenseClaw. This page summarizes how to work on the repo; a fuller guide is planned for **iteration 5**.
+Thank you for helping improve DefenseClaw.
 
 ## Getting started
 
@@ -8,12 +8,15 @@ Thank you for helping improve DefenseClaw. This page summarizes how to work on t
 2. Build: `make build`
 3. Run tests: `make test`
 
-Ensure Go 1.22+ and, for scanner integration, Python 3.9+ with the scanners from `scripts/setup-scanners.sh`.
+Ensure Go 1.25+ and Python 3.10+ are installed. For scanner integration, install
+the external scanners via `defenseclaw init` or manually with
+`scripts/setup-scanners.sh`.
 
 ## Code style
 
-- Use **standard Go** conventions: `gofmt`, clear package boundaries, and errors wrapped with context (`fmt.Errorf` with `%w`)
-- Run **`golangci-lint`** via `make lint` before opening a PR
+- **Python**: `ruff` for linting, Click for CLI commands, standard `pyproject.toml` conventions
+- **Go**: `gofmt`, clear package boundaries, errors wrapped with `fmt.Errorf` and `%w`
+- Run `make lint` before opening a PR (covers both Python and Go)
 - Follow the project layout in `CLAUDE.md` (internal packages, Cobra commands, no `os.Exit` outside `main`)
 
 ## Pull request process
@@ -25,4 +28,6 @@ Ensure Go 1.22+ and, for scanner integration, Python 3.9+ with the scanners from
 
 ## DCO sign-off
 
-All commits must include a **Developer Certificate of Origin** sign-off (for example `Signed-off-by: Your Name <email@example.com>`). Use `git commit -s` to add the line automatically.
+All commits must include a **Developer Certificate of Origin** sign-off
+(for example `Signed-off-by: Your Name <email@example.com>`). Use
+`git commit -s` to add the line automatically.

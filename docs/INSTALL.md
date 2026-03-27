@@ -36,532 +36,479 @@ On **macOS**, OpenShell is not available. DefenseClaw still works for scanning, 
 
 ---
 
-## Part A: Adding DefenseClaw to an Existing OpenClaw Deployment
+## Building from Source
 
-Use this if OpenClaw is already running on your system.
+This section covers building DefenseClaw from the repository.
 
-### DGX Spark (aarch64 / Ubuntu)
+### Prerequisites
 
-#### Prerequisites
+| Tool | Minimum | Check | Install |
+|------|---------|-------|---------|
+| Go | 1.25+ | `go version` | [go.dev/dl](https://go.dev/dl/) or `brew install go` |
+| Python | 3.10+ (3.12 recommended) | `python3 --version` | System package manager or [python.org](https://python.org) |
+| uv | latest | `uv --version` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Node.js / npm | 18+ | `node --version` | [nodejs.org](https://nodejs.org) or `brew install node` |
+| Git | any | `git --version` | System package manager |
 
-| Requirement | Check |
-|-------------|-------|
-| OpenClaw running | `openclaw status` or check your agent process |
-| Python 3.11+ | `python3 --version` |
-| Go 1.22+ (build from source) | `go version` |
-| Git | `git --version` |
+Python 3.11+ is recommended if you need the MCP scanner
+(`cisco-ai-mcp-scanner` has a `python_version >= "3.11"` gate).
 
-#### Step 1: Build DefenseClaw
+### Clone and Build Everything
 
 ```bash
-# Clone the repository
 git clone https://github.com/defenseclaw/defenseclaw.git
 cd defenseclaw
 
-# Build and install everything (Python CLI + Go gateway + OpenClaw plugin)
-make install
-
-# Or build individual components
-make gateway              # Go gateway binary only
-make build-linux-arm64    # Cross-compile gateway for DGX Spark
+# Build all three components (does not install)
+make build
 ```
 
-If you are cross-compiling from a different machine (e.g., your Mac):
+`make build` produces:
+
+| Component | Output |
+|-----------|--------|
+| Python CLI | `.venv/bin/defenseclaw` |
+| Go gateway | `./defenseclaw-gateway` (current platform) |
+| OpenClaw plugin | `extensions/defenseclaw/dist/` |
+
+### Build and Install Everything
 
 ```bash
-make build-linux-arm64
-scp defenseclaw-linux-arm64 your-spark:/tmp/defenseclaw
-# Then on the Spark:
-sudo mv /tmp/defenseclaw /usr/local/bin/defenseclaw
-sudo chmod +x /usr/local/bin/defenseclaw
+make install
 ```
 
-#### Step 2: Initialize
+`make install` builds all components and installs them to their
+target locations:
+
+| Component | Installed to |
+|-----------|-------------|
+| Python CLI | `.venv/bin/defenseclaw` (activate with `source .venv/bin/activate`) |
+| Go gateway | `~/.local/bin/defenseclaw-gateway` |
+| OpenClaw plugin | `~/.defenseclaw/extensions/defenseclaw/` |
+
+On macOS the gateway binary is automatically ad-hoc codesigned.
+
+After install, activate the Python environment and initialize:
+
+```bash
+source .venv/bin/activate
+defenseclaw init
+```
+
+### Building Individual Components
+
+```bash
+# Python CLI only (creates .venv, installs editable)
+make pycli
+
+# Go gateway only (outputs ./defenseclaw-gateway)
+make gateway
+
+# OpenClaw TypeScript plugin only (outputs extensions/defenseclaw/dist/)
+make plugin
+```
+
+Install individual components without rebuilding everything:
+
+```bash
+# Gateway → ~/.local/bin/defenseclaw-gateway
+make gateway-install
+
+# Plugin → ~/.defenseclaw/extensions/defenseclaw/
+make plugin-install
+```
+
+### Cross-Compilation
+
+Build the Go gateway for a different platform:
+
+```bash
+# Linux amd64 (e.g., cloud VM)
+make gateway-cross GOOS=linux GOARCH=amd64
+
+# Linux arm64 (e.g., DGX Spark)
+make gateway-cross GOOS=linux GOARCH=arm64
+
+# macOS Intel
+make gateway-cross GOOS=darwin GOARCH=amd64
+```
+
+Output binary is named `defenseclaw-{GOOS}-{GOARCH}`. Copy it to the
+target machine:
+
+```bash
+scp defenseclaw-linux-arm64 spark:/tmp/defenseclaw-gateway
+ssh spark 'sudo mv /tmp/defenseclaw-gateway /usr/local/bin/defenseclaw-gateway && sudo chmod +x /usr/local/bin/defenseclaw-gateway'
+```
+
+### Dev Install
+
+For contributors and development workflows:
+
+```bash
+make dev-install
+```
+
+This runs `scripts/install-dev.sh`, which:
+
+1. Creates a `.venv` with editable install + dev dependencies (ruff,
+   pytest, pytest-cov)
+2. Builds the Go gateway
+3. Optionally installs the gateway binary to `~/.local/bin`
+4. Installs `golangci-lint` and `opa` via `go install` if missing
+
+Flags:
+
+```bash
+./scripts/install-dev.sh --check        # Dependency checks only
+./scripts/install-dev.sh --skip-install  # Build but don't install to ~/.local/bin
+./scripts/install-dev.sh --yes           # Non-interactive
+```
+
+Alternatively, install the Python CLI with dev dependencies directly:
+
+```bash
+make dev-pycli    # pycli + dev group (ruff, pytest)
+source .venv/bin/activate
+```
+
+---
+
+## Building Release Artifacts (`make dist`)
+
+The `make dist` target builds all release artifacts for distribution.
+Use this when preparing a release or testing the installer locally.
+
+### Produce All Artifacts
+
+```bash
+make dist
+```
+
+This runs `dist-cli`, `dist-gateway`, `dist-plugin`, and
+`dist-checksums` in sequence. Output goes to `dist/`:
+
+```
+dist/
+├── defenseclaw-0.2.0-py3-none-any.whl       # Python CLI wheel
+├── defenseclaw-gateway-linux-amd64           # Gateway binary (linux/amd64)
+├── defenseclaw-gateway-linux-arm64           # Gateway binary (linux/arm64)
+├── defenseclaw-gateway-darwin-amd64          # Gateway binary (macOS Intel)
+├── defenseclaw-gateway-darwin-arm64          # Gateway binary (macOS Apple Silicon)
+├── defenseclaw-plugin-0.2.0.tar.gz           # OpenClaw plugin tarball
+└── checksums.txt                             # SHA-256 checksums
+```
+
+### Individual Dist Targets
+
+```bash
+make dist-cli       # Build Python wheel (bundles guardrail module, Rego policies, CodeGuard skill)
+make dist-gateway   # Cross-compile gateway for all 4 platform/arch combos
+make dist-plugin    # Build and tar the OpenClaw plugin with runtime deps
+make dist-checksums # Generate SHA-256 checksums.txt
+```
+
+`dist-cli` bundles data files into the wheel before building:
+guardrail module, Rego policies, `data.json`, YAML policy templates,
+and the CodeGuard skill.
+
+### Install from Local Dist
+
+Test the release artifacts locally using the install script:
+
+```bash
+./scripts/install.sh --local dist/
+```
+
+This installs the gateway binary, Python CLI wheel (into
+`~/.defenseclaw/.venv`), and plugin without downloading anything.
+
+### Upload to GitHub Release
+
+```bash
+gh release create v0.2.0 dist/*
+```
+
+### Clean Dist
+
+```bash
+make dist-clean   # Remove dist/ and bundled _data/
+make clean        # Full clean (binaries, venv, node_modules, coverage)
+```
+
+### Curl-to-Bash Installer
+
+End users can install a released version without cloning the repo:
+
+```bash
+curl -LsSf https://github.com/defenseclaw/defenseclaw/releases/latest/download/install.sh | bash
+```
+
+The installer detects the platform, downloads the correct gateway
+binary + CLI wheel + plugin tarball, installs them, and prompts to run
+`defenseclaw init --enable-guardrail`. Use `--yes` / `-y` to skip
+confirmations.
+
+Pin a specific version:
+
+```bash
+VERSION=0.2.0 curl -LsSf .../install.sh | bash
+```
+
+---
+
+## Setup Commands Reference
+
+After building and running `defenseclaw init`, use the `setup`
+subcommands to configure individual components. All `setup` commands
+support `--non-interactive` for scripted use and `--verify` /
+`--no-verify` to toggle post-setup connectivity checks.
+
+### `defenseclaw init`
+
+One-time initialization. Creates `~/.defenseclaw/`, installs scanner
+dependencies, seeds config and audit database, copies Rego policies
+and the CodeGuard skill, and starts the sidecar if the gateway binary
+is on PATH.
 
 ```bash
 defenseclaw init
 ```
 
-This creates `~/.defenseclaw/` and installs the Python scanner dependencies automatically. You will see output for each scanner as it installs.
+| Flag | Description |
+|------|-------------|
+| `--skip-install` | Skip scanner dependency checks and package installs |
+| `--enable-guardrail` | Run interactive guardrail setup (LiteLLM + OpenClaw plugin) during init |
 
-Expected output:
+What init does, step by step:
 
-```
-[init] Environment: dgx-spark
-[init] Creating /home/you/.defenseclaw/
-[init] Installing scanner dependencies...
-  Installing cisco-ai-skill-scanner... done
-  Installing cisco-ai-mcp-scanner... done
-  Installing cisco-aibom... done
-[init] Scanners ready.
-[init] SQLite audit database created.
-[init] DefenseClaw initialized.
-```
-
-If you want to skip scanner installation (they're already installed):
+1. Detects environment (DGX Spark vs macOS)
+2. Creates `~/.defenseclaw/` directory tree
+3. Copies Rego policies and `data.json` to `~/.defenseclaw/policies/`
+4. Seeds the Splunk bridge directory (for `setup splunk --logs`)
+5. Creates `config.yaml` and SQLite audit database
+6. Checks that scanner CLIs (`skill-scanner`, `mcp-scanner`) are
+   importable
+7. Reads gateway defaults from OpenClaw config + generates device key
+8. If `--enable-guardrail`: runs the full guardrail setup flow
+   (LiteLLM proxy, guardrail module, OpenClaw plugin)
+9. Installs the CodeGuard skill to `~/.openclaw/skills/codeguard/`
+10. Starts `defenseclaw-gateway` if the binary exists on PATH
 
 ```bash
+# Skip scanner installs (already have them)
 defenseclaw init --skip-install
+
+# Init + guardrail in one step (recommended for first install)
+defenseclaw init --enable-guardrail
 ```
 
-#### Step 3: Scan your existing environment
+### `defenseclaw setup guardrail`
+
+Configure the LLM guardrail that inspects prompts and completions
+flowing through the LiteLLM proxy.
 
 ```bash
-# Scan all skills in your OpenClaw skills directory
-defenseclaw scan skill /path/to/your/openclaw/skills/my-skill/
-
-# Scan an MCP server your agent connects to
-defenseclaw scan mcp https://your-mcp-server.example.com
-
-# Scan code for security issues
-defenseclaw scan code /path/to/your/project/
-
-# Run all scanners at once against a directory
-defenseclaw scan /path/to/your/openclaw/
+defenseclaw setup guardrail
 ```
 
-#### Step 4: Deploy with full enforcement
+| Flag | Description |
+|------|-------------|
+| `--mode MODE` | `observe` (log only) or `action` (block dangerous content) |
+| `--scanner-mode MODE` | `local` (pattern matching) or `remote` (Cisco AI Defense API) |
+| `--port PORT` | LiteLLM proxy port |
+| `--block-message TEXT` | Custom message shown when content is blocked in action mode |
+| `--cisco-endpoint URL` | Cisco AI Defense API endpoint |
+| `--cisco-api-key-env VAR` | Env var name for Cisco API key |
+| `--cisco-timeout-ms MS` | Cisco API timeout |
+| `--restart` | Restart `defenseclaw-gateway` and monitor OpenClaw gateway after setup |
+| `--disable` | Disable the guardrail and revert OpenClaw config |
+| `--verify` / `--no-verify` | Run connectivity checks after setup |
+| `--non-interactive` | Apply flags without prompts |
+
+What guardrail setup does:
+
+1. Installs the `litellm[proxy]` Python package
+2. Writes LiteLLM proxy config (`litellm_config.yaml`)
+3. Installs the guardrail module (`defenseclaw_guardrail.py`)
+4. Installs the DefenseClaw OpenClaw plugin
+5. Patches `openclaw.json` to route LLM calls through the proxy
+6. Saves settings to `config.yaml` and API keys to `.env`
+7. Writes `guardrail_runtime.json` for live mode toggling
 
 ```bash
-defenseclaw deploy /path/to/your/openclaw/
+# Non-interactive with specific mode
+defenseclaw setup guardrail --mode action --scanner-mode local --non-interactive
+
+# Disable and revert
+defenseclaw setup guardrail --disable
+
+# Disable and restart gateway
+defenseclaw setup guardrail --disable --restart
 ```
 
-This runs the complete flow:
-1. Ensures init is complete
-2. Scans all skills, MCP servers, code, and AI dependencies
-3. Auto-blocks anything with HIGH or CRITICAL findings
-4. Generates an OpenShell sandbox policy from the results
-5. Starts OpenClaw inside the OpenShell sandbox
+### `defenseclaw setup skill-scanner`
 
-Check status at any time:
+Configure which analyzers the skill scanner uses when scanning skills.
 
 ```bash
-defenseclaw status
+defenseclaw setup skill-scanner
 ```
 
-#### Step 5: Open the dashboard
+| Flag | Description |
+|------|-------------|
+| `--policy PRESET` | `strict`, `balanced`, or `permissive` |
+| `--use-llm` | Enable LLM-based code analysis |
+| `--use-behavioral` | Enable behavioral pattern analysis |
+| `--enable-meta` | Enable meta-analyzer |
+| `--use-trigger` | Enable trigger analyzer |
+| `--use-virustotal` | Enable VirusTotal scanning |
+| `--use-aidefense` | Enable Cisco AI Defense analyzer |
+| `--llm-provider PROVIDER` | `anthropic` or `openai` |
+| `--llm-model MODEL` | Model name for LLM analyzer |
+| `--llm-consensus-runs N` | Number of LLM consensus runs (0 = disabled) |
+| `--lenient` | Tolerate malformed skills |
+| `--verify` / `--no-verify` | Run connectivity checks after setup |
+| `--non-interactive` | Apply flags without prompts |
+
+Interactive mode prompts for each analyzer, LLM provider/model/API
+key, VirusTotal/Cisco API keys (saved to `~/.defenseclaw/.env`), and
+a policy preset. On verify, runs a quick scanner check and reports any
+connectivity issues.
 
 ```bash
-defenseclaw tui
+# Quick strict setup
+defenseclaw setup skill-scanner --policy strict --use-llm --llm-provider anthropic --non-interactive
+
+# Permissive with no external APIs
+defenseclaw setup skill-scanner --policy permissive --non-interactive
 ```
 
-Navigate with `tab` between panels, `j`/`k` to move through lists, `b` to block, `a` to allow, `d` to dismiss alerts, `q` to quit.
+### `defenseclaw setup mcp-scanner`
 
----
-
-### macOS (Apple Silicon)
-
-On macOS, DefenseClaw works for scanning, governance, and audit. Sandbox enforcement is skipped because OpenShell is not available on macOS.
-
-#### Prerequisites
-
-| Requirement | Check |
-|-------------|-------|
-| OpenClaw running | Your agent process or dev server |
-| Python 3.11+ | `python3 --version` |
-| Go 1.22+ (build from source) | `go version` |
-| Git | `git --version` |
-
-Install Go if needed:
+Configure which analyzers the MCP scanner uses.
 
 ```bash
-brew install go
+defenseclaw setup mcp-scanner
 ```
 
-#### Step 1: Build and Install DefenseClaw
+| Flag | Description |
+|------|-------------|
+| `--analyzers LIST` | Comma-separated analyzer list (e.g. `yara,api,llm,behavioral,readiness`) |
+| `--llm-provider PROVIDER` | `anthropic` or `openai` |
+| `--llm-model MODEL` | Model for LLM analyzer |
+| `--scan-prompts` | Scan MCP server prompts |
+| `--scan-resources` | Scan MCP server resources |
+| `--scan-instructions` | Scan MCP server instructions |
+| `--non-interactive` | Apply flags without prompts |
+
+MCP server URLs are managed separately with `defenseclaw mcp set` /
+`defenseclaw mcp unset`, not through this setup command.
 
 ```bash
-git clone https://github.com/defenseclaw/defenseclaw.git
-cd defenseclaw
-
-# Build and install everything (Python CLI + Go gateway + OpenClaw plugin)
-make install
-
-# Activate the Python environment
-source .venv/bin/activate
-
-# Verify
-defenseclaw --help
+defenseclaw setup mcp-scanner --analyzers yara,api,behavioral --non-interactive
 ```
 
-#### Step 2: Initialize
+### `defenseclaw setup gateway`
+
+Configure the connection to the OpenClaw gateway (local or remote).
 
 ```bash
-defenseclaw init
+defenseclaw setup gateway
 ```
 
-Expected output on macOS:
+| Flag | Description |
+|------|-------------|
+| `--remote` | Configure for a remote gateway (interactive: SSM or manual token) |
+| `--host HOST` | Gateway WebSocket host |
+| `--port PORT` | Gateway WebSocket port |
+| `--api-port PORT` | Sidecar REST API port |
+| `--token TOKEN` | Auth token (saved to `.env` as `OPENCLAW_GATEWAY_TOKEN`) |
+| `--ssm-param PARAM` | Fetch token from AWS SSM Parameter Store |
+| `--ssm-region REGION` | AWS region for SSM |
+| `--ssm-profile PROFILE` | AWS CLI profile for SSM |
+| `--verify` / `--no-verify` | Run gateway and sidecar health checks after setup |
+| `--non-interactive` | Apply flags without prompts; auto-detects token from OpenClaw config |
 
-```
-[init] Environment: macos
-[init] Creating /Users/you/.defenseclaw/
-[init] Installing scanner dependencies...
-  Installing cisco-ai-skill-scanner... done
-  Installing cisco-ai-mcp-scanner... done
-  Installing cisco-aibom... done
-[init] Scanners ready.
-[init] SQLite audit database created.
-[init] DefenseClaw initialized.
-```
-
-#### Step 3: Scan your environment
+In local interactive mode, the setup can read the gateway token from
+`openclaw.json` (`gateway.auth.token`) automatically.
 
 ```bash
-# Scan a skill
-defenseclaw scan skill ./path/to/skill/
+# Local with explicit port
+defenseclaw setup gateway --host 127.0.0.1 --api-port 18790 --non-interactive
 
-# Scan an MCP server
-defenseclaw scan mcp https://your-mcp-server.example.com
-
-# Scan code
-defenseclaw scan code ./your-project/
-
-# Generate AI bill of materials
-defenseclaw scan aibom .
+# Remote with SSM token
+defenseclaw setup gateway --remote --ssm-param /prod/openclaw/token --ssm-region us-west-2 --non-interactive
 ```
 
-#### Step 4: Deploy
+### `defenseclaw setup splunk`
+
+Configure Splunk integration for audit export and observability.
 
 ```bash
-defenseclaw deploy ./your-project/
+defenseclaw setup splunk
 ```
 
-On macOS, the sandbox step prints:
+| Flag | Description |
+|------|-------------|
+| `--o11y` | Enable Splunk Observability Cloud (OTLP traces + metrics) |
+| `--logs` | Enable local Splunk Enterprise via Docker (HEC) |
+| `--realm REALM` | Splunk O11y realm |
+| `--access-token TOKEN` | Splunk O11y access token |
+| `--app-name NAME` | Application name for traces |
+| `--disable` | Disable integration(s); combine with `--o11y` / `--logs` to scope |
+| `--non-interactive` | Requires at least `--o11y` or `--logs` |
 
-```
-Step 5/5: Starting sandbox...
-  OpenShell not available on macOS — sandbox enforcement skipped
-```
-
-Everything else works: scanning, auto-blocking, policy generation, audit logging.
-
-#### Step 5: Manage and monitor
+The `--logs` option requires Docker and sets up a local Splunk
+Enterprise container with the DefenseClaw Splunk bridge
+(`splunk-claw-bridge`).
 
 ```bash
-# Check status
-defenseclaw status
+# Enable Splunk Observability
+defenseclaw setup splunk --o11y --realm us1 --access-token $SPLUNK_TOKEN --non-interactive
 
-# View alerts
-defenseclaw alerts
+# Enable local Splunk logs (requires Docker)
+defenseclaw setup splunk --logs --non-interactive
 
-# Open the TUI dashboard
-defenseclaw tui
-
-# Block a risky skill
-defenseclaw block skill ./risky-skill --reason "data exfiltration pattern"
-
-# View block/allow lists
-defenseclaw list blocked
-defenseclaw list allowed
+# Disable both
+defenseclaw setup splunk --disable
 ```
 
----
+### `defenseclaw doctor`
 
-## Part B: Fresh Install — OpenClaw + OpenShell + DefenseClaw
-
-Use this if you are starting from scratch.
-
-### DGX Spark (aarch64 / Ubuntu)
-
-#### Step 1: Install OpenShell
-
-OpenShell is NVIDIA's sandbox for isolating AI agent workloads. Install it from the NVIDIA container toolkit:
+Run diagnostic checks to verify that all DefenseClaw components are
+healthy and properly configured.
 
 ```bash
-# Add the NVIDIA container toolkit repository
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-  sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-sudo apt-get update
-
-# Install OpenShell
-sudo apt-get install -y nvidia-openshell
-
-# Verify
-openshell --version
+defenseclaw doctor
 ```
 
-> **Note:** The exact installation steps may vary depending on your DGX Spark
-> software version. Refer to the
-> [NVIDIA OpenShell documentation](https://docs.nvidia.com/openshell/) for the
-> latest instructions specific to your system.
+Checks performed:
 
-#### Step 2: Install OpenClaw
+| Check | What it verifies |
+|-------|------------------|
+| Config file | `~/.defenseclaw/config.yaml` exists and is valid |
+| Audit database | SQLite database is accessible |
+| Scanner binaries | `skill-scanner` and `mcp-scanner` CLIs are on PATH |
+| Sidecar health | `GET /health` to the sidecar; reports gateway, watcher, and guardrail sub-states |
+| OpenClaw gateway | `GET /health` to the OpenClaw gateway (if configured) |
+| Guardrail proxy | LiteLLM proxy liveliness check (if guardrail is enabled) |
+| LLM API key | Probe Anthropic or OpenAI API (if LLM analyzer is configured) |
+| Cisco AI Defense | Endpoint health check (if remote scanner mode is enabled) |
+| VirusTotal | API connectivity check (if VirusTotal is enabled) |
+| Splunk HEC | HEC endpoint check (if Splunk is enabled) |
 
-OpenClaw is the AI agent framework. Install it inside the OpenShell sandbox environment:
+Output uses colored PASS/FAIL/WARN/SKIP indicators. Exits with code 1
+if any check fails.
 
 ```bash
-# Install OpenClaw
-pip install openclaw
-
-# Or from source
-git clone https://github.com/nvidia/openclaw.git
-cd openclaw
-pip install -e .
-
-# Verify
-openclaw --version
+# Run all checks
+defenseclaw doctor
 ```
 
-> **Note:** Consult the
-> [OpenClaw documentation](https://github.com/nvidia/openclaw) for the latest
-> installation instructions, configuration options, and supported models.
-
-#### Step 3: Configure OpenClaw
-
-Create your OpenClaw configuration:
-
-```bash
-mkdir -p ~/.openclaw
-
-cat > ~/.openclaw/config.yaml << 'YAML'
-agent:
-  name: my-agent
-  model: nvidia/llama-3.1-nemotron-70b-instruct
-
-skills_dir: ~/.openclaw/skills
-mcp_servers: []
-YAML
-```
-
-Install skills your agent needs:
-
-```bash
-mkdir -p ~/.openclaw/skills
-# Copy or install your skills into this directory
-```
-
-#### Step 4: Install DefenseClaw
-
-```bash
-git clone https://github.com/defenseclaw/defenseclaw.git
-cd defenseclaw
-
-# Full install (Python CLI + Go gateway + OpenClaw plugin)
-make install
-
-# Or for DGX Spark cross-compile only:
-make build-linux-arm64
-sudo cp defenseclaw-linux-arm64 /usr/local/bin/defenseclaw
-sudo chmod +x /usr/local/bin/defenseclaw
-```
-
-#### Step 5: Initialize DefenseClaw
-
-```bash
-defenseclaw init
-```
-
-This detects your DGX Spark environment, installs scanner dependencies, and creates the configuration.
-
-#### Step 6: Deploy with DefenseClaw
-
-Instead of starting OpenClaw manually, let DefenseClaw orchestrate the entire launch:
-
-```bash
-defenseclaw deploy ~/.openclaw/
-```
-
-This:
-1. Scans all skills, MCP servers, code, and AI dependencies
-2. Auto-blocks anything HIGH/CRITICAL
-3. Generates an OpenShell sandbox policy that restricts network access and file permissions to only what your agent needs
-4. Starts OpenClaw inside the OpenShell sandbox with the generated policy
-
-#### Step 7: Verify
-
-```bash
-# Check everything is running
-defenseclaw status
-
-# Output should show:
-#   Environment:  dgx-spark
-#   Sandbox:      running
-#   Scanners:     all installed
-#   Blocked:      any auto-blocked items
-#   Active alerts: count of findings
-
-# Open the dashboard
-defenseclaw tui
-```
-
-#### Step 8: Ongoing operations
-
-```bash
-# Re-scan everything after adding new skills
-defenseclaw rescan
-
-# View audit trail
-defenseclaw audit
-
-# Stop the sandbox
-defenseclaw stop
-```
-
----
-
-### macOS (Apple Silicon) — Development Setup
-
-macOS is ideal for developing and testing skills locally before deploying to DGX Spark. OpenShell is not available on macOS, so there is no sandbox enforcement, but scanning, governance, and the TUI all work.
-
-#### Step 1: Install OpenClaw
-
-```bash
-# Using pip
-pip install openclaw
-
-# Or using uv
-uv pip install openclaw
-
-# Verify
-openclaw --version
-```
-
-> **Note:** Refer to the [OpenClaw documentation](https://github.com/nvidia/openclaw)
-> for macOS-specific setup, model configuration, and any additional dependencies.
-
-#### Step 2: Configure OpenClaw
-
-```bash
-mkdir -p ~/.openclaw
-
-cat > ~/.openclaw/config.yaml << 'YAML'
-agent:
-  name: dev-agent
-  model: nvidia/llama-3.1-nemotron-70b-instruct
-
-skills_dir: ~/.openclaw/skills
-mcp_servers: []
-YAML
-```
-
-#### Step 3: Install DefenseClaw
-
-```bash
-# Install Go if needed
-brew install go
-
-# Clone and install
-git clone https://github.com/defenseclaw/defenseclaw.git
-cd defenseclaw
-make install
-
-# Activate the Python environment
-source .venv/bin/activate
-```
-
-#### Step 4: Initialize and deploy
-
-```bash
-# Initialize (installs scanner dependencies)
-defenseclaw init
-
-# Deploy (scans, enforces, skips sandbox on macOS)
-defenseclaw deploy ~/.openclaw/
-```
-
-Expected macOS output:
-
-```
-Step 5/5: Starting sandbox...
-  OpenShell not available on macOS — sandbox enforcement skipped
-```
-
-#### Step 5: Develop safely
-
-```bash
-# Scan a skill you're developing
-defenseclaw scan skill ./my-new-skill/
-
-# Scan your code for security issues
-defenseclaw scan code ./my-project/
-
-# Check what's blocked
-defenseclaw list blocked
-
-# Open the dashboard
-defenseclaw tui
-```
-
-#### Step 6: Move to DGX Spark
-
-When you're ready to deploy to production:
-
-```bash
-# On your Mac: cross-compile for DGX Spark
-make build-linux-arm64
-
-# Copy binary and your skill to the Spark
-scp defenseclaw-linux-arm64 spark:/usr/local/bin/defenseclaw
-scp -r ./my-new-skill/ spark:~/.openclaw/skills/
-
-# On the Spark: deploy with full sandbox enforcement
-ssh spark
-defenseclaw deploy ~/.openclaw/
-```
-
----
-
-## Upgrading OpenClaw
-
-When a new version of OpenClaw is released, use DefenseClaw to safely upgrade.
-
-### DGX Spark
-
-```bash
-# Stop the current sandbox
-defenseclaw stop
-
-# Upgrade OpenClaw
-pip install --upgrade openclaw
-
-# Re-scan everything with the new version
-defenseclaw rescan
-
-# Re-deploy with the updated OpenClaw
-defenseclaw deploy ~/.openclaw/
-
-# Verify
-defenseclaw status
-```
-
-### macOS
-
-```bash
-# Upgrade OpenClaw
-pip install --upgrade openclaw
-
-# Re-scan
-defenseclaw rescan
-
-# Re-deploy
-defenseclaw deploy ~/.openclaw/
-```
-
----
-
-## Upgrading DefenseClaw
-
-```bash
-cd defenseclaw
-git pull origin main
-
-# Rebuild and reinstall everything
-make install
-
-# Or upgrade individual components
-make gateway-install    # Go gateway only
-make plugin-install     # OpenClaw plugin only
-
-# Verify
-defenseclaw --version
-```
-
-Your `~/.defenseclaw/` data directory (config, audit log, block/allow lists) is preserved across upgrades.
+Other setup commands run a subset of these checks when `--verify` is
+enabled (the default). If verification fails, the output suggests
+running `defenseclaw doctor` for the full report.
 
 ---
 

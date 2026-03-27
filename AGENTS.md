@@ -27,7 +27,7 @@ Enterprise governance layer for OpenClaw. Wraps Cisco AI Defense scanners and NV
 
 ## Tech Stack (locked)
 
-- **Go 1.22+** — single binary, cross-compile to linux/amd64, linux/arm64, darwin/arm64, darwin/amd64
+- **Go 1.25+** — single binary, cross-compile to linux/amd64, linux/arm64, darwin/arm64, darwin/amd64
 - **Cobra + Viper** — CLI framework + config
 - **Bubbletea + Lipgloss + Bubbles** — TUI (charmbracelet stack)
 - **SQLite** (`modernc.org/sqlite`) — audit log, scan results, block/allow lists (no external DB)
