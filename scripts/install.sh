@@ -213,8 +213,11 @@ resolve_version() {
     fi
 
     RELEASE_VERSION=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*"v\?//' | sed 's/".*//') \
+        | grep -oE '"tag_name": *"[^"]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') \
         || die "Failed to fetch latest release. Use --local <dir> for local installs."
+
+    [[ -n "${RELEASE_VERSION}" ]] \
+        || die "Could not parse release version. Use VERSION=x.y.z or --local <dir>."
 
     ok "Latest release: ${RELEASE_VERSION}"
 }
