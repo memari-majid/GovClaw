@@ -26,6 +26,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,12 +59,22 @@ type APIServer struct {
 	// ScannerMode) which can be changed at runtime via the PATCH
 	// /v1/guardrail/config endpoint while other goroutines read them.
 	cfgMu sync.RWMutex
+
+	// policyReloader, when set, is called by the /policy/reload handler
+	// to atomically refresh the shared OPA engine used by the watcher.
+	policyReloader func() error
 }
 
 // SetOTelProvider attaches the OTel provider so guardrail events
 // can be recorded as metrics.
 func (a *APIServer) SetOTelProvider(p *telemetry.Provider) {
 	a.otel = p
+}
+
+// SetPolicyReloader registers a callback that atomically reloads the
+// shared OPA policy engine.  It is called by the /policy/reload handler.
+func (a *APIServer) SetPolicyReloader(fn func() error) {
+	a.policyReloader = fn
 }
 
 // NewAPIServer creates the REST API server bound to the given address.
@@ -107,6 +118,7 @@ func (a *APIServer) Run(ctx context.Context) error {
 	mux.HandleFunc("/mcps", a.handleMCPs)
 	mux.HandleFunc("/tools/catalog", a.handleToolsCatalog)
 	mux.HandleFunc("/v1/skill/scan", a.handleSkillScan)
+	mux.HandleFunc("/v1/plugin/scan", a.handlePluginScan)
 	mux.HandleFunc("/v1/mcp/scan", a.handleMCPScan)
 	mux.HandleFunc("/v1/skill/fetch", a.handleSkillFetch)
 	mux.HandleFunc("/v1/guardrail/event", a.handleGuardrailEvent)
@@ -114,8 +126,9 @@ func (a *APIServer) Run(ctx context.Context) error {
 	mux.HandleFunc("/v1/guardrail/config", a.handleGuardrailConfig)
 	mux.HandleFunc("/api/v1/inspect/tool", a.handleInspectTool)
 	mux.HandleFunc("/api/v1/scan/code", a.handleCodeScan)
+	mux.HandleFunc("/api/v1/network-egress", a.handleNetworkEgress)
 
-	handler := a.metricsMiddleware(csrfProtect(mux))
+	handler := a.metricsMiddleware(csrfProtect(maxBodyMiddleware(mux, 1<<20)))
 	if a.scannerCfg != nil && a.scannerCfg.Gateway.Token != "" {
 		handler = a.tokenAuth(handler)
 	}
@@ -698,6 +711,9 @@ func (a *APIServer) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
+	if limit > 500 {
+		limit = 500
+	}
 
 	alerts, err := a.store.ListAlerts(limit)
 	if err != nil {
@@ -921,6 +937,53 @@ func (a *APIServer) handleSkillScan(w http.ResponseWriter, r *http.Request) {
 
 	if a.logger != nil {
 		_ = a.logger.LogAction("api-skill-scan", req.Target, fmt.Sprintf("findings=%d max=%s", len(result.Findings), result.MaxSeverity()))
+		_ = a.logger.LogScanWithVerdict(result, "")
+	}
+
+	a.writeJSON(w, http.StatusOK, result)
+}
+
+func (a *APIServer) handlePluginScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req skillScanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Target == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target is required"})
+		return
+	}
+
+	if info, err := os.Stat(req.Target); err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "[api] warning: plugin target directory not found locally: %s\n", req.Target)
+	}
+
+	if a.scannerCfg == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "scanner not configured"})
+		return
+	}
+
+	ps := scanner.NewPluginScanner(a.scannerCfg.Scanners.PluginScanner)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	result, err := ps.Scan(ctx, req.Target)
+	if err != nil {
+		if a.otel != nil {
+			a.otel.RecordScanError(r.Context(), "plugin-scanner", "plugin", classifyScanError(err))
+		}
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if a.logger != nil {
+		_ = a.logger.LogAction("api-plugin-scan", req.Target, fmt.Sprintf("findings=%d max=%s", len(result.Findings), result.MaxSeverity()))
 		_ = a.logger.LogScanWithVerdict(result, "")
 	}
 
@@ -1435,6 +1498,17 @@ func (a *APIServer) tokenAuth(next http.Handler) http.Handler {
 //  2. Content-Type containing "application/json"
 //  3. Origin, if present, must be a localhost address
 //
+// maxBodyMiddleware caps the request body size for state-changing methods
+// to prevent memory exhaustion from oversized payloads.
+func maxBodyMiddleware(next http.Handler, maxBytes int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Read-only requests (GET, HEAD, OPTIONS) are exempt.
 func csrfProtect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1466,16 +1540,12 @@ func csrfProtect(next http.Handler) http.Handler {
 }
 
 func isLocalhostOrigin(origin string) bool {
-	for _, prefix := range []string{
-		"http://127.0.0.1", "http://localhost",
-		"http://[::1]", "https://127.0.0.1",
-		"https://localhost", "https://[::1]",
-	} {
-		if strings.HasPrefix(origin, prefix) {
-			return true
-		}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
 	}
-	return false
+	host := u.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 func (a *APIServer) writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -1728,27 +1798,41 @@ func (a *APIServer) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engine, err := policy.New(a.scannerCfg.PolicyDir)
-	if err != nil {
-		if a.otel != nil {
-			a.otel.RecordPolicyReload(r.Context(), "failed")
+	// If a shared OPA engine is wired, use its atomic Reload(); otherwise
+	// validate by constructing a throwaway engine (backward-compatible).
+	if a.policyReloader != nil {
+		if err := a.policyReloader(); err != nil {
+			if a.otel != nil {
+				a.otel.RecordPolicyReload(r.Context(), "failed")
+			}
+			a.writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":  "reload failed: " + err.Error(),
+				"status": "failed",
+			})
+			return
 		}
-		a.writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error":  "reload failed: " + err.Error(),
-			"status": "failed",
-		})
-		return
-	}
-
-	if err := engine.Compile(); err != nil {
-		if a.otel != nil {
-			a.otel.RecordPolicyReload(r.Context(), "failed")
+	} else {
+		engine, err := policy.New(a.scannerCfg.PolicyDir)
+		if err != nil {
+			if a.otel != nil {
+				a.otel.RecordPolicyReload(r.Context(), "failed")
+			}
+			a.writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":  "reload failed: " + err.Error(),
+				"status": "failed",
+			})
+			return
 		}
-		a.writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":  "compilation failed: " + err.Error(),
-			"status": "failed",
-		})
-		return
+		if err := engine.Compile(); err != nil {
+			if a.otel != nil {
+				a.otel.RecordPolicyReload(r.Context(), "failed")
+			}
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":  "compilation failed: " + err.Error(),
+				"status": "failed",
+			})
+			return
+		}
 	}
 
 	if a.otel != nil {
@@ -1817,4 +1901,115 @@ func (a *APIServer) handleCodeScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.writeJSON(w, http.StatusOK, result)
+}
+
+// handleNetworkEgress serves GET /api/v1/network-egress and
+// POST /api/v1/network-egress.
+//
+// GET  — list structured outbound network call records from the audit DB.
+//
+//	Query params:
+//	  limit=N    (default 50, max 500)
+//	  hostname=H (filter to exact hostname)
+//
+// POST — ingest a single egress event from an external observer (e.g. a
+//
+//	runtime hook running inside the agent process) so that it is
+//	persisted alongside tool-lifecycle events.
+func (a *APIServer) handleNetworkEgress(w http.ResponseWriter, r *http.Request) {
+	if a.store == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit store not configured"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		a.handleNetworkEgressList(w, r)
+	case http.MethodPost:
+		a.handleNetworkEgressIngest(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *APIServer) handleNetworkEgressList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	limit := 50
+	if raw := q.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 500 {
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be 1–500"})
+			return
+		}
+		limit = parsed
+	}
+
+	f := audit.NetworkEgressFilter{
+		Hostname:  q.Get("hostname"),
+		SessionID: q.Get("session_id"),
+		Limit:     limit,
+	}
+
+	// ?blocked=true|false — optional boolean filter
+	if raw := q.Get("blocked"); raw != "" {
+		var b bool
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "true", "1":
+			b = true
+		case "false", "0":
+			b = false
+		default:
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "blocked must be true, false, 1, or 0"})
+			return
+		}
+		f.Blocked = &b
+	}
+
+	// ?since=<RFC3339> — optional time lower-bound filter
+	if raw := q.Get("since"); raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "since must be RFC3339 (e.g. 2026-01-02T15:04:05Z)"})
+			return
+		}
+		f.Since = t
+	}
+
+	events, err := a.store.QueryNetworkEgressEvents(f)
+	if err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	type response struct {
+		Events []audit.NetworkEgressRow `json:"events"`
+		Count  int                      `json:"count"`
+	}
+	if events == nil {
+		events = []audit.NetworkEgressRow{}
+	}
+	a.writeJSON(w, http.StatusOK, response{Events: events, Count: len(events)})
+}
+
+func (a *APIServer) handleNetworkEgressIngest(w http.ResponseWriter, r *http.Request) {
+	var evt audit.NetworkEgressEvent
+	if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if err := evt.Validate(); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if a.logger == nil {
+		a.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit logger not configured"})
+		return
+	}
+	if err := a.logger.LogNetworkEgress(r.Context(), evt); err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

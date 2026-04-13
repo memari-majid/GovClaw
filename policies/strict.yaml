@@ -123,6 +123,11 @@ firewall:
   allowed_ports:
     - 443
 
+# Periodic rescan / drift detection settings (not policy file watching).
+watch:
+  rescan_enabled: true
+  rescan_interval_min: 30
+
 enforcement:
   max_enforcement_delay_seconds: 1
 

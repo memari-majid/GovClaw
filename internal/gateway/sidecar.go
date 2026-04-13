@@ -47,6 +47,7 @@ type Sidecar struct {
 	shell  *sandbox.OpenShell
 	otel   *telemetry.Provider
 	notify *NotificationQueue
+	opa    *policy.Engine
 
 	alertCtx    context.Context
 	alertCancel context.CancelFunc
@@ -74,6 +75,19 @@ func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, sh
 
 	router := NewEventRouter(client, store, logger, cfg.Gateway.AutoApprove, otel)
 	router.notify = notify
+
+	// Wire LLM judge for tool call injection detection if configured.
+	if cfg.Guardrail.Judge.Enabled && cfg.Guardrail.Judge.ToolInjection {
+		dotenvPath := filepath.Join(cfg.DataDir, ".env")
+		judge := NewLLMJudge(&cfg.Guardrail.Judge, dotenvPath)
+		if judge != nil {
+			router.SetJudge(judge)
+			fmt.Fprintf(os.Stderr, "[sidecar] LLM judge enabled for tool call inspection (model=%s)\n",
+				cfg.Guardrail.Judge.Model)
+		}
+	}
+
+
 	client.OnEvent = router.Route
 
 	alertCtx, alertCancel := context.WithCancel(context.Background())
@@ -101,6 +115,26 @@ func (s *Sidecar) Run(ctx context.Context) error {
 	fmt.Fprintf(os.Stderr, "[sidecar] starting subsystems (auto_approve=%v watcher=%v api_port=%d guardrail=%v run_id=%s)\n",
 		s.cfg.Gateway.AutoApprove, s.cfg.Gateway.Watcher.Enabled, s.cfg.Gateway.APIPort, s.cfg.Guardrail.Enabled, runID)
 	_ = s.logger.LogAction("sidecar-start", "", "starting all subsystems")
+
+	if s.cfg.Guardrail.Enabled && s.cfg.Guardrail.Model == "" {
+		fmt.Fprintf(os.Stderr, "[sidecar] WARNING: guardrail.enabled is true but guardrail.model is empty — relying on fetch-interceptor routing.\n")
+		fmt.Fprintf(os.Stderr, "[sidecar]          Set guardrail.model in ~/.defenseclaw/config.yaml only if you need a fixed advertised model name.\n")
+	}
+
+	// Initialize OPA engine before goroutines so both the watcher and the
+	// API reload handler share the same instance.
+	if s.cfg.PolicyDir != "" {
+		if engine, err := policy.New(s.cfg.PolicyDir); err == nil {
+			if compileErr := engine.Compile(); compileErr == nil {
+				s.opa = engine
+				fmt.Fprintf(os.Stderr, "[sidecar] OPA policy engine loaded from %s\n", s.cfg.PolicyDir)
+			} else {
+				fmt.Fprintf(os.Stderr, "[sidecar] OPA compile error (falling back to built-in): %v\n", compileErr)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[sidecar] OPA init skipped (falling back to built-in): %v\n", err)
+		}
+	}
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
@@ -273,22 +307,7 @@ func (s *Sidecar) runWatcher(ctx context.Context) error {
 		"plugin_take_action": wcfg.Plugin.TakeAction,
 	})
 
-	var opa *policy.Engine
-	if s.cfg.PolicyDir != "" {
-		regoDir := s.cfg.PolicyDir
-		if engine, err := policy.New(regoDir); err == nil {
-			if compileErr := engine.Compile(); compileErr == nil {
-				opa = engine
-				fmt.Fprintf(os.Stderr, "[sidecar] OPA policy engine loaded from %s\n", regoDir)
-			} else {
-				fmt.Fprintf(os.Stderr, "[sidecar] OPA compile error (falling back to built-in): %v\n", compileErr)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "[sidecar] OPA init skipped (falling back to built-in): %v\n", err)
-		}
-	}
-
-	w := watcher.New(s.cfg, skillDirs, pluginDirs, s.store, s.logger, s.shell, opa, s.otel, func(r watcher.AdmissionResult) {
+	w := watcher.New(s.cfg, skillDirs, pluginDirs, s.store, s.logger, s.shell, s.opa, s.otel, func(r watcher.AdmissionResult) {
 		s.handleAdmissionResult(r)
 	})
 	if s.otel != nil {
@@ -538,6 +557,9 @@ func (s *Sidecar) runAPI(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", bind, s.cfg.Gateway.APIPort)
 	api := NewAPIServer(addr, s.health, s.client, s.store, s.logger, s.cfg)
 	api.SetOTelProvider(s.otel)
+	if s.opa != nil {
+		api.SetPolicyReloader(s.opa.Reload)
+	}
 	return api.Run(ctx)
 }
 

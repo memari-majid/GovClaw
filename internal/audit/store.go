@@ -153,12 +153,45 @@ func (s *Store) Init() error {
 		updated_at DATETIME NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS network_egress_events (
+		id TEXT PRIMARY KEY,
+		timestamp DATETIME NOT NULL,
+		session_id TEXT,
+		hostname TEXT NOT NULL,
+		url TEXT,
+		http_method TEXT,
+		protocol TEXT,
+		policy_outcome TEXT NOT NULL,
+		decision_code TEXT,
+		blocked INTEGER NOT NULL DEFAULT 0,
+		severity TEXT NOT NULL DEFAULT 'INFO',
+		details TEXT
+	);
+
+	CREATE TABLE IF NOT EXISTS target_snapshots (
+		id TEXT PRIMARY KEY,
+		target_type TEXT NOT NULL,
+		target_path TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		dependency_hashes TEXT,
+		config_hashes TEXT,
+		network_endpoints TEXT,
+		scan_id TEXT,
+		captured_at DATETIME NOT NULL,
+		UNIQUE(target_type, target_path)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
 	CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action);
 	CREATE INDEX IF NOT EXISTS idx_scan_scanner ON scan_results(scanner);
 	CREATE INDEX IF NOT EXISTS idx_finding_severity ON findings(severity);
 	CREATE INDEX IF NOT EXISTS idx_finding_scan ON findings(scan_id);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_type_name ON actions(target_type, target_name);
+	CREATE INDEX IF NOT EXISTS idx_egress_timestamp ON network_egress_events(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_egress_hostname ON network_egress_events(hostname);
+	CREATE INDEX IF NOT EXISTS idx_egress_blocked ON network_egress_events(blocked);
+	CREATE INDEX IF NOT EXISTS idx_egress_session ON network_egress_events(session_id);
+	CREATE INDEX IF NOT EXISTS idx_snapshots_target ON target_snapshots(target_type, target_path);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -248,7 +281,19 @@ func (s *Store) ensureRunIDColumns() error {
 	return nil
 }
 
+// knownTables is the set of tables hasColumn is allowed to inspect.
+var knownTables = map[string]bool{
+	"audit_events":          true,
+	"scan_results":          true,
+	"actions":               true,
+	"target_snapshots":      true,
+	"network_egress_events": true,
+}
+
 func (s *Store) hasColumn(table, column string) (bool, error) {
+	if !knownTables[table] {
+		return false, fmt.Errorf("audit: hasColumn called with unknown table %q", table)
+	}
 	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return false, fmt.Errorf("audit: pragma table_info(%s): %w", table, err)
@@ -704,12 +749,13 @@ func (s *Store) ListFindingsByScan(scanID string) ([]FindingRow, error) {
 }
 
 type Counts struct {
-	BlockedSkills int
-	AllowedSkills int
-	BlockedMCPs   int
-	AllowedMCPs   int
-	Alerts        int
-	TotalScans    int
+	BlockedSkills      int
+	AllowedSkills      int
+	BlockedMCPs        int
+	AllowedMCPs        int
+	Alerts             int
+	TotalScans         int
+	BlockedEgressCalls int // total outbound network calls blocked by policy
 }
 
 func (s *Store) GetCounts() (Counts, error) {
@@ -724,6 +770,7 @@ func (s *Store) GetCounts() (Counts, error) {
 		{`SELECT COUNT(*) FROM actions WHERE target_type = 'mcp' AND json_extract(actions_json, '$.install') = 'allow'`, &c.AllowedMCPs},
 		{`SELECT COUNT(*) FROM audit_events WHERE severity IN ('CRITICAL','HIGH','MEDIUM','LOW')`, &c.Alerts},
 		{`SELECT COUNT(*) FROM scan_results`, &c.TotalScans},
+		{`SELECT COUNT(*) FROM network_egress_events WHERE blocked = 1`, &c.BlockedEgressCalls},
 	}
 	for _, q := range queries {
 		if err := s.db.QueryRow(q.sql).Scan(q.dest); err != nil {
@@ -731,6 +778,80 @@ func (s *Store) GetCounts() (Counts, error) {
 		}
 	}
 	return c, nil
+}
+
+// NetworkEgressFilter parameterises QueryNetworkEgressEvents.
+// Zero values mean "no filter". Limit defaults to 100 when zero.
+type NetworkEgressFilter struct {
+	Hostname  string    // exact match; empty = all hosts
+	SessionID string    // exact match; empty = all sessions
+	Since     time.Time // only events at or after this time; zero = all time
+	Blocked   *bool     // nil = all; &true = blocked only; &false = allowed only
+	Limit     int       // defaults to 100
+}
+
+// QueryNetworkEgressEvents returns egress events matching the filter, newest first.
+func (s *Store) QueryNetworkEgressEvents(f NetworkEgressFilter) ([]NetworkEgressRow, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `SELECT id, timestamp, session_id, hostname, url, http_method, protocol,
+	                 policy_outcome, decision_code, blocked, severity, details
+	          FROM network_egress_events WHERE 1=1`
+	var args []any
+
+	if f.Hostname != "" {
+		query += " AND hostname = ?"
+		args = append(args, f.Hostname)
+	}
+	if f.SessionID != "" {
+		query += " AND session_id = ?"
+		args = append(args, f.SessionID)
+	}
+	if !f.Since.IsZero() {
+		query += " AND julianday(timestamp) >= julianday(?)"
+		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if f.Blocked != nil {
+		blocked := 0
+		if *f.Blocked {
+			blocked = 1
+		}
+		query += " AND blocked = ?"
+		args = append(args, blocked)
+	}
+	query += " ORDER BY julianday(timestamp) DESC, timestamp DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("audit: query network egress events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []NetworkEgressRow
+	for rows.Next() {
+		var e NetworkEgressRow
+		var sessionID, url, httpMethod, protocol, decisionCode, details sql.NullString
+		var blocked int
+		if err := rows.Scan(
+			&e.ID, &e.Timestamp, &sessionID, &e.Hostname, &url, &httpMethod, &protocol,
+			&e.PolicyOutcome, &decisionCode, &blocked, &e.Severity, &details,
+		); err != nil {
+			return nil, fmt.Errorf("audit: scan egress row: %w", err)
+		}
+		e.SessionID = sessionID.String
+		e.URL = url.String
+		e.HTTPMethod = httpMethod.String
+		e.Protocol = protocol.String
+		e.DecisionCode = decisionCode.String
+		e.Details = details.String
+		e.Blocked = blocked != 0
+		events = append(events, e)
+	}
+	return events, rows.Err()
 }
 
 type LatestScanInfo struct {
@@ -771,6 +892,183 @@ func (s *Store) LatestScansByScanner(scannerName string) ([]LatestScanInfo, erro
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// --- Network Egress Events ---
+
+// NetworkEgressRow is the persisted shape of a network_egress_events row.
+type NetworkEgressRow struct {
+	ID            string    `json:"id"`
+	Timestamp     time.Time `json:"timestamp"`
+	SessionID     string    `json:"session_id,omitempty"`
+	Hostname      string    `json:"hostname"`
+	URL           string    `json:"url,omitempty"`
+	HTTPMethod    string    `json:"http_method,omitempty"`
+	Protocol      string    `json:"protocol,omitempty"`
+	PolicyOutcome string    `json:"policy_outcome"`
+	DecisionCode  string    `json:"decision_code,omitempty"`
+	Blocked       bool      `json:"blocked"`
+	Severity      string    `json:"severity"`
+	Details       string    `json:"details,omitempty"`
+}
+
+// InsertNetworkEgressEvent persists one outbound network call as a structured row.
+func (s *Store) InsertNetworkEgressEvent(e NetworkEgressRow) error {
+	if e.ID == "" {
+		e.ID = uuid.New().String()
+	}
+	if e.Timestamp.IsZero() {
+		e.Timestamp = time.Now().UTC()
+	}
+	if e.Severity == "" {
+		e.Severity = "INFO"
+	}
+	ts := e.Timestamp.Format(time.RFC3339Nano)
+	blocked := 0
+	if e.Blocked {
+		blocked = 1
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO network_egress_events
+		 (id, timestamp, session_id, hostname, url, http_method, protocol, policy_outcome, decision_code, blocked, severity, details)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, ts,
+		nullStr(e.SessionID), e.Hostname, nullStr(e.URL), nullStr(e.HTTPMethod), nullStr(e.Protocol),
+		e.PolicyOutcome, nullStr(e.DecisionCode), blocked, e.Severity, nullStr(e.Details),
+	)
+	if err != nil {
+		return fmt.Errorf("audit: insert network egress event: %w", err)
+	}
+	return nil
+}
+
+// GetScanRawJSON returns the raw JSON blob for a scan result by ID.
+func (s *Store) GetScanRawJSON(scanID string) (string, error) {
+	var raw string
+	err := s.db.QueryRow("SELECT raw_json FROM scan_results WHERE id = ?", scanID).Scan(&raw)
+	if err != nil {
+		return "", fmt.Errorf("audit: get scan raw json: %w", err)
+	}
+	return raw, nil
+}
+
+// SnapshotRow represents a stored target snapshot for drift detection.
+type SnapshotRow struct {
+	ID               string    `json:"id"`
+	TargetType       string    `json:"target_type"`
+	TargetPath       string    `json:"target_path"`
+	ContentHash      string    `json:"content_hash"`
+	DependencyHashes string    `json:"dependency_hashes"`
+	ConfigHashes     string    `json:"config_hashes"`
+	NetworkEndpoints string    `json:"network_endpoints"`
+	ScanID           string    `json:"scan_id"`
+	CapturedAt       time.Time `json:"captured_at"`
+}
+
+// SetTargetSnapshot upserts a snapshot baseline for drift comparison.
+func (s *Store) SetTargetSnapshot(targetType, targetPath, contentHash, depHashes, cfgHashes, endpoints, scanID string) error {
+	id := uuid.New().String()
+	now := time.Now().UTC()
+	_, err := s.db.Exec(
+		`INSERT INTO target_snapshots (id, target_type, target_path, content_hash, dependency_hashes, config_hashes, network_endpoints, scan_id, captured_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(target_type, target_path) DO UPDATE SET
+		 	content_hash = excluded.content_hash,
+		 	dependency_hashes = excluded.dependency_hashes,
+		 	config_hashes = excluded.config_hashes,
+		 	network_endpoints = excluded.network_endpoints,
+		 	scan_id = excluded.scan_id,
+		 	captured_at = excluded.captured_at`,
+		id, targetType, targetPath, contentHash, depHashes, cfgHashes, endpoints, scanID, now,
+	)
+	if err != nil {
+		return fmt.Errorf("audit: set target snapshot: %w", err)
+	}
+	return nil
+}
+
+// ListNetworkEgressEvents returns recent egress events. Optionally filter by
+// hostname prefix (empty string returns all). Results are newest-first.
+func (s *Store) ListNetworkEgressEvents(limit int, hostname string) ([]NetworkEgressRow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if hostname == "" {
+		rows, err = s.db.Query(
+			`SELECT id, timestamp, session_id, hostname, url, http_method, protocol,
+			        policy_outcome, decision_code, blocked, severity, details
+			 FROM network_egress_events
+			 ORDER BY julianday(timestamp) DESC, timestamp DESC LIMIT ?`, limit,
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, timestamp, session_id, hostname, url, http_method, protocol,
+			        policy_outcome, decision_code, blocked, severity, details
+			 FROM network_egress_events WHERE hostname = ?
+			 ORDER BY julianday(timestamp) DESC, timestamp DESC LIMIT ?`, hostname, limit,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("audit: list network egress events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []NetworkEgressRow
+	for rows.Next() {
+		var e NetworkEgressRow
+		var sessionID, url, httpMethod, protocol, decisionCode, details sql.NullString
+		var blocked int
+		if err := rows.Scan(
+			&e.ID, &e.Timestamp, &sessionID, &e.Hostname, &url, &httpMethod, &protocol,
+			&e.PolicyOutcome, &decisionCode, &blocked, &e.Severity, &details,
+		); err != nil {
+			return nil, fmt.Errorf("audit: scan egress row: %w", err)
+		}
+		e.SessionID = sessionID.String
+		e.URL = url.String
+		e.HTTPMethod = httpMethod.String
+		e.Protocol = protocol.String
+		e.DecisionCode = decisionCode.String
+		e.Details = details.String
+		e.Blocked = blocked != 0
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// CountBlockedEgress returns the total number of blocked egress events.
+func (s *Store) CountBlockedEgress() (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM network_egress_events WHERE blocked = 1`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("audit: count blocked egress: %w", err)
+	}
+	return count, nil
+}
+
+// GetTargetSnapshot loads the stored baseline snapshot for a target.
+func (s *Store) GetTargetSnapshot(targetType, targetPath string) (*SnapshotRow, error) {
+	row := s.db.QueryRow(
+		`SELECT id, target_type, target_path, content_hash, dependency_hashes, config_hashes, network_endpoints, scan_id, captured_at
+		 FROM target_snapshots WHERE target_type = ? AND target_path = ?`,
+		targetType, targetPath,
+	)
+	var r SnapshotRow
+	var ts string
+	err := row.Scan(&r.ID, &r.TargetType, &r.TargetPath, &r.ContentHash, &r.DependencyHashes, &r.ConfigHashes, &r.NetworkEndpoints, &r.ScanID, &ts)
+	if err != nil {
+		return nil, fmt.Errorf("audit: get target snapshot: %w", err)
+	}
+	r.CapturedAt, _ = time.Parse(time.RFC3339Nano, ts)
+	if r.CapturedAt.IsZero() {
+		r.CapturedAt, _ = time.Parse("2006-01-02 15:04:05", ts)
+	}
+	return &r, nil
 }
 
 func (s *Store) Close() error {

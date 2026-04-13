@@ -18,7 +18,6 @@
 
 import { execFile } from "node:child_process";
 import { DaemonClient } from "../client.js";
-import { scanPlugin } from "../scanners/plugin_scanner/index.js";
 import { scanMCPServer } from "../scanners/mcp-scanner.js";
 import type {
   ScanResult,
@@ -41,7 +40,7 @@ export function runSkillScan(
       { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout, stderr) => {
         const code = error && "code" in error ? (error.code as number) : 0;
-        if (code !== 0 && !stdout.trim()) {
+        if (code !== 0) {
           reject(
             new Error(
               `defenseclaw skill scan exited ${code}: ${stderr.trim().slice(0, 200)}`,
@@ -51,6 +50,10 @@ export function runSkillScan(
         }
         try {
           const data = JSON.parse(stdout);
+          if (data.findings != null && !Array.isArray(data.findings)) {
+            reject(new Error("skill scan returned malformed findings (not an array)"));
+            return;
+          }
           const findings: Finding[] = (data.findings ?? []).map(
             (f: Record<string, unknown>) => ({
               id: (f.id as string) ?? "",
@@ -77,6 +80,117 @@ export function runSkillScan(
   });
 }
 
+export function runPluginScan(
+  target: string,
+  timeoutMs = 120_000,
+): Promise<ScanResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "defenseclaw",
+      ["plugin", "scan", target, "--json"],
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const code = error && "code" in error ? (error.code as number) : 0;
+        if (code !== 0) {
+          reject(
+            new Error(
+              `defenseclaw plugin scan exited ${code}: ${stderr.trim().slice(0, 200)}`,
+            ),
+          );
+          return;
+        }
+        try {
+          const data = JSON.parse(stdout);
+          if (data.findings != null && !Array.isArray(data.findings)) {
+            reject(new Error("plugin scan returned malformed findings (not an array)"));
+            return;
+          }
+          const findings: Finding[] = (data.findings ?? []).map(
+            (f: Record<string, unknown>) => ({
+              id: (f.id as string) ?? "",
+              severity: (f.severity as string) ?? "INFO",
+              title: (f.title as string) ?? "",
+              description: (f.description as string) ?? "",
+              location: (f.location as string) ?? "",
+              remediation: (f.remediation as string) ?? "",
+              scanner: (f.scanner as string) ?? "plugin-scanner",
+              tags: (f.tags as string[]) ?? [],
+            }),
+          );
+          resolve({
+            scanner: "plugin-scanner",
+            target,
+            timestamp: new Date().toISOString(),
+            findings,
+          });
+        } catch {
+          reject(new Error("failed to parse plugin scan output"));
+        }
+      },
+    );
+  });
+}
+
+export async function runRemotePluginScan(
+  target: string,
+  sidecarBaseUrl: string,
+  sidecarToken = "",
+  timeoutMs = 120_000,
+): Promise<ScanResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-DefenseClaw-Client": "openclaw-plugin",
+    };
+    if (sidecarToken) {
+      headers.Authorization = `Bearer ${sidecarToken}`;
+    }
+
+    const res = await fetch(`${sidecarBaseUrl}/v1/plugin/scan`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ target }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`sidecar returned HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    const data = (await res.json()) as Record<string, unknown>;
+    if (data.findings != null && !Array.isArray(data.findings)) {
+      throw new Error("remote plugin scan returned malformed findings (not an array)");
+    }
+    const findings: Finding[] = ((data.findings ?? []) as Record<string, unknown>[]).map((f) => ({
+      id: (f.id as string) ?? "",
+      severity: ((f.severity as string) ?? "INFO") as Severity,
+      title: (f.title as string) ?? "",
+      description: (f.description as string) ?? "",
+      location: (f.location as string) ?? "",
+      remediation: (f.remediation as string) ?? "",
+      scanner: (f.scanner as string) ?? "plugin-scanner",
+      tags: (f.tags as string[]) ?? [],
+    }));
+
+    return {
+      scanner: "plugin-scanner",
+      target,
+      timestamp: new Date().toISOString(),
+      findings,
+    };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("plugin scan timed out");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Run a CodeGuard code scan via the Go sidecar API.
  * Unlike skill scans (which shell out), CodeGuard is built into the sidecar binary.
@@ -84,17 +198,23 @@ export function runSkillScan(
 export async function runCodeScan(
   target: string,
   sidecarBaseUrl: string,
+  sidecarToken = "",
   timeoutMs = 30_000,
 ): Promise<ScanResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-DefenseClaw-Client": "openclaw-plugin",
+    };
+    if (sidecarToken) {
+      headers.Authorization = `Bearer ${sidecarToken}`;
+    }
+
     const res = await fetch(`${sidecarBaseUrl}/api/v1/scan/code`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-DefenseClaw-Client": "openclaw-plugin",
-      },
+      headers,
       body: JSON.stringify({ path: target }),
       signal: controller.signal,
     });
@@ -105,9 +225,10 @@ export async function runCodeScan(
     }
 
     const data = (await res.json()) as Record<string, unknown>;
-    const findings: Finding[] = (
-      (data.findings as Record<string, unknown>[]) ?? []
-    ).map((f) => ({
+    if (data.findings != null && !Array.isArray(data.findings)) {
+      throw new Error("code scan returned malformed findings (not an array)");
+    }
+    const findings: Finding[] = ((data.findings ?? []) as Record<string, unknown>[]).map((f) => ({
       id: (f.id as string) ?? "",
       severity: ((f.severity as string) ?? "INFO") as Severity,
       title: (f.title as string) ?? "",
@@ -168,7 +289,7 @@ export class PolicyEnforcer {
     pluginName: string,
   ): Promise<AdmissionResult> {
     return this.evaluate("plugin", pluginName, pluginDir, () =>
-      scanPlugin(pluginDir),
+      runPluginScan(pluginDir),
     );
   }
 
@@ -236,20 +357,26 @@ export class PolicyEnforcer {
     ]);
 
     if (blocked.ok && blocked.data) {
+      const freshKeys = new Set<string>();
       for (const entry of blocked.data) {
-        this.localBlockList.set(
-          `${entry.target_type}:${entry.target_name}`,
-          entry.reason,
-        );
+        const key = `${entry.target_type}:${entry.target_name}`;
+        this.localBlockList.set(key, entry.reason);
+        freshKeys.add(key);
+      }
+      for (const key of this.localBlockList.keys()) {
+        if (!freshKeys.has(key)) this.localBlockList.delete(key);
       }
     }
 
     if (allowed.ok && allowed.data) {
+      const freshKeys = new Set<string>();
       for (const entry of allowed.data) {
-        this.localAllowList.set(
-          `${entry.target_type}:${entry.target_name}`,
-          entry.reason,
-        );
+        const key = `${entry.target_type}:${entry.target_name}`;
+        this.localAllowList.set(key, entry.reason);
+        freshKeys.add(key);
+      }
+      for (const key of this.localAllowList.keys()) {
+        if (!freshKeys.has(key)) this.localAllowList.delete(key);
       }
     }
   }

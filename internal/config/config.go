@@ -146,9 +146,11 @@ func (c *SplunkConfig) ResolvedHECToken() string {
 }
 
 type WatchConfig struct {
-	DebounceMs          int  `mapstructure:"debounce_ms"          yaml:"debounce_ms"`
-	AutoBlock           bool `mapstructure:"auto_block"           yaml:"auto_block"`
+	DebounceMs          int  `mapstructure:"debounce_ms"            yaml:"debounce_ms"`
+	AutoBlock           bool `mapstructure:"auto_block"             yaml:"auto_block"`
 	AllowListBypassScan bool `mapstructure:"allow_list_bypass_scan" yaml:"allow_list_bypass_scan"`
+	RescanEnabled       bool `mapstructure:"rescan_enabled"         yaml:"rescan_enabled"`
+	RescanIntervalMin   int  `mapstructure:"rescan_interval_min"    yaml:"rescan_interval_min"`
 }
 
 type InspectLLMConfig struct {
@@ -324,6 +326,7 @@ type JudgeConfig struct {
 	PII           bool    `mapstructure:"pii"             yaml:"pii"`
 	PIIPrompt     bool    `mapstructure:"pii_prompt"      yaml:"pii_prompt"`
 	PIICompletion bool    `mapstructure:"pii_completion"  yaml:"pii_completion"`
+	ToolInjection bool    `mapstructure:"tool_injection"  yaml:"tool_injection"`
 	Model         string  `mapstructure:"model"           yaml:"model"`
 	APIKeyEnv     string  `mapstructure:"api_key_env"     yaml:"api_key_env"`
 	APIBase       string  `mapstructure:"api_base"        yaml:"api_base"`
@@ -598,7 +601,7 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("scanners.mcp_scanner.scan_prompts", false)
 	viper.SetDefault("scanners.mcp_scanner.scan_resources", false)
 	viper.SetDefault("scanners.mcp_scanner.scan_instructions", false)
-	viper.SetDefault("scanners.plugin_scanner", "defenseclaw-plugin-scanner")
+	viper.SetDefault("scanners.plugin_scanner", "defenseclaw")
 	viper.SetDefault("scanners.codeguard", filepath.Join(dataDir, "codeguard-rules"))
 	viper.SetDefault("openshell.binary", "openshell")
 	viper.SetDefault("openshell.policy_dir", "/etc/openshell/policies")
@@ -608,6 +611,8 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("watch.debounce_ms", 500)
 	viper.SetDefault("watch.auto_block", true)
 	viper.SetDefault("watch.allow_list_bypass_scan", true)
+	viper.SetDefault("watch.rescan_enabled", true)
+	viper.SetDefault("watch.rescan_interval_min", 60)
 
 	viper.SetDefault("splunk.hec_endpoint", "https://localhost:8088/services/collector/event")
 	viper.SetDefault("splunk.hec_token", "")
@@ -679,6 +684,7 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("guardrail.judge.pii", true)
 	viper.SetDefault("guardrail.judge.pii_prompt", true)
 	viper.SetDefault("guardrail.judge.pii_completion", true)
+	viper.SetDefault("guardrail.judge.tool_injection", true)
 	viper.SetDefault("guardrail.judge.timeout", 30.0)
 
 	viper.SetDefault("gateway.host", "127.0.0.1")

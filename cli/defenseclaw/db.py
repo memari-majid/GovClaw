@@ -29,7 +29,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from defenseclaw.models import ActionEntry, ActionState, Counts, Event
+from defenseclaw.models import ActionEntry, ActionState, Counts, Event, TargetSnapshot
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -78,12 +78,45 @@ CREATE TABLE IF NOT EXISTS actions (
     updated_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS network_egress_events (
+    id TEXT PRIMARY KEY,
+    timestamp DATETIME NOT NULL,
+    session_id TEXT,
+    hostname TEXT NOT NULL,
+    url TEXT,
+    http_method TEXT,
+    protocol TEXT,
+    policy_outcome TEXT NOT NULL,
+    decision_code TEXT,
+    blocked INTEGER NOT NULL DEFAULT 0,
+    severity TEXT NOT NULL DEFAULT 'INFO',
+    details TEXT
+);
+
+CREATE TABLE IF NOT EXISTS target_snapshots (
+    id TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    dependency_hashes TEXT,
+    config_hashes TEXT,
+    network_endpoints TEXT,
+    scan_id TEXT,
+    captured_at DATETIME NOT NULL,
+    UNIQUE(target_type, target_path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action);
 CREATE INDEX IF NOT EXISTS idx_scan_scanner ON scan_results(scanner);
 CREATE INDEX IF NOT EXISTS idx_finding_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_finding_scan ON findings(scan_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_type_name ON actions(target_type, target_name);
+CREATE INDEX IF NOT EXISTS idx_egress_timestamp ON network_egress_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_egress_hostname ON network_egress_events(hostname);
+CREATE INDEX IF NOT EXISTS idx_egress_blocked ON network_egress_events(blocked);
+CREATE INDEX IF NOT EXISTS idx_egress_session ON network_egress_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_target ON target_snapshots(target_type, target_path);
 """
 
 _VALID_FIELDS: dict[str, set[str]] = {
@@ -452,6 +485,9 @@ class Store:
                 "SELECT COUNT(*) FROM audit_events WHERE severity IN ('CRITICAL','HIGH','MEDIUM','LOW')"
             ),
             total_scans=_count("SELECT COUNT(*) FROM scan_results"),
+            blocked_egress_calls=_count(
+                "SELECT COUNT(*) FROM network_egress_events WHERE blocked = 1"
+            ),
         )
 
     # -- Row converters --
@@ -467,6 +503,60 @@ class Store:
             details=row[5] or "",
             severity=row[6] or "",
             run_id=row[7] or "",
+        )
+
+    def get_target_snapshot(
+        self, target_type: str, target_path: str
+    ) -> TargetSnapshot | None:
+        row = self.db.execute(
+            "SELECT id, target_type, target_path, content_hash,"
+            " dependency_hashes, config_hashes, network_endpoints,"
+            " scan_id, captured_at"
+            " FROM target_snapshots"
+            " WHERE target_type = ? AND target_path = ?",
+            (target_type, target_path),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_snapshot(row)
+
+    def list_drift_events(self, limit: int = 50) -> list[Event]:
+        rows = self.db.execute(
+            "SELECT id, timestamp, action, target, actor,"
+            " details, severity, run_id"
+            " FROM audit_events WHERE action = 'drift'"
+            " ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_event(r) for r in rows]
+
+    @staticmethod
+    def _row_to_snapshot(row: tuple[Any, ...]) -> TargetSnapshot:
+        dep_raw = row[4] or "{}"
+        cfg_raw = row[5] or "{}"
+        ep_raw = row[6] or "[]"
+        try:
+            dep = json.loads(dep_raw)
+        except (json.JSONDecodeError, TypeError):
+            dep = {}
+        try:
+            cfg = json.loads(cfg_raw)
+        except (json.JSONDecodeError, TypeError):
+            cfg = {}
+        try:
+            eps = json.loads(ep_raw)
+        except (json.JSONDecodeError, TypeError):
+            eps = []
+        return TargetSnapshot(
+            id=row[0],
+            target_type=row[1],
+            target_path=row[2],
+            content_hash=row[3],
+            dependency_hashes=dep,
+            config_hashes=cfg,
+            network_endpoints=eps,
+            scan_id=row[7] or "",
+            captured_at=_parse_ts(row[8]),
         )
 
     @staticmethod
