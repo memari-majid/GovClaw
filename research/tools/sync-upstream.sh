@@ -4,12 +4,10 @@
 # Safe to run repeatedly. The script:
 #   1. Verifies `upstream` remote is configured correctly.
 #   2. Refuses to run on a dirty working tree.
-#   3. Refuses to run on a branch other than `main` unless the caller
-#      explicitly opts in via GOVCLAW_SYNC_BRANCH=<branch>.
-#   4. Fetches upstream and summarises what's new.
-#   5. Merges upstream/main with a --no-ff merge commit (clear provenance).
-#   6. Re-applies the GovClaw README banner (idempotent).
-#   7. Prints a reminder to re-run the experiment battery.
+#   3. Fetches upstream and summarises what's new.
+#   4. Merges upstream/main with a --no-ff merge commit (clear provenance).
+#   5. Re-applies the GovClaw README banner (idempotent).
+#   6. Prints a reminder to re-run the experiment battery.
 
 set -euo pipefail
 
@@ -42,20 +40,14 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     die "working tree is dirty; commit or stash first"
 fi
 
-# ---------------------------------------------------------------------------
-# 3. Refuse to merge onto the wrong branch. The script merges into HEAD, so
-#    running on a feature branch would silently contaminate that branch with
-#    upstream history. Default target is `main`; power-users can opt into
-#    another branch with GOVCLAW_SYNC_BRANCH=<branch>.
-# ---------------------------------------------------------------------------
-expected_branch="${GOVCLAW_SYNC_BRANCH:-main}"
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
-if [[ "$current_branch" != "$expected_branch" ]]; then
-    die "current branch is '$current_branch' but sync targets '$expected_branch'; run 'git checkout $expected_branch' first, or set GOVCLAW_SYNC_BRANCH='$current_branch' to opt in explicitly"
+if [[ "$current_branch" != "main" ]]; then
+    warn "current branch is '$current_branch' (expected 'main')"
+    warn "switch with: git checkout main"
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Fetch and summarise.
+# 3. Fetch and summarise.
 # ---------------------------------------------------------------------------
 log "fetching upstream..."
 git fetch upstream --tags --prune
@@ -73,7 +65,7 @@ log "upstream/$UPSTREAM_BRANCH is $count commit(s) ahead:"
 git log --oneline --no-decorate HEAD..upstream/"$UPSTREAM_BRANCH" | sed 's/^/       /'
 
 # ---------------------------------------------------------------------------
-# 5. Merge with a --no-ff commit.
+# 4. Merge with a --no-ff commit.
 # ---------------------------------------------------------------------------
 short="$(git rev-parse --short "$upstream_head")"
 msg="chore(upstream): sync upstream/$UPSTREAM_BRANCH@$short"
@@ -81,7 +73,7 @@ log "merging upstream/$UPSTREAM_BRANCH into $current_branch with --no-ff..."
 git merge --no-ff -m "$msg" "upstream/$UPSTREAM_BRANCH"
 
 # ---------------------------------------------------------------------------
-# 6. Re-apply the GovClaw banner on README.md (idempotent).
+# 5. Re-apply the GovClaw banner on README.md (idempotent).
 # ---------------------------------------------------------------------------
 log "ensuring GovClaw banner is present on README.md..."
 bash "$REPO_ROOT/research/tools/apply-banner.sh"
@@ -94,7 +86,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Wrap up.
+# 6. Wrap up.
 # ---------------------------------------------------------------------------
 log "sync complete."
 log "  previous HEAD: $(git rev-parse --short "$old_head")"
