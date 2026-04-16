@@ -1,3 +1,15 @@
+<!-- govclaw:banner:start -->
+> **GovClaw — A Research Study of Governance Layers for Open Agentic AI.**
+> This repository is a **research fork** of
+> [`cisco-ai-defense/defenseclaw`](https://github.com/cisco-ai-defense/defenseclaw).
+> Upstream code is tracked unchanged; all research artifacts (manuscript,
+> notes, experiments, figures, data) live under
+> [`research/`](research/). Start here: [`RESEARCH.md`](RESEARCH.md) ·
+> [`research/paper/paper.md`](research/paper/paper.md) ·
+> [`UPSTREAM.md`](UPSTREAM.md). Re-apply this banner after any upstream sync
+> with `research/tools/apply-banner.sh`.
+<!-- govclaw:banner:end -->
+
 ```
      ____         ____                       ____  _
     / __ \  ___  / __/___   ___   ___  ___  / ___|| | __ _ __      __

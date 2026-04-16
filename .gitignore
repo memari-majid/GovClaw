@@ -74,3 +74,15 @@ coverage*.xml
 scripts/provision-*
 scripts/e2e-*-session*
 .worktrees/
+
+# ------------------------------------------------------------------
+# GovClaw research fork (see RESEARCH.md, UPSTREAM.md, research/)
+# Ignore build artifacts + raw experiment outputs; keep source tracked.
+# ------------------------------------------------------------------
+research/build/
+research/data/
+!research/data/.gitkeep
+research/experiments/**/out/
+research/paper/build/
+research/paper/*.pdf
+research/paper/*.html
