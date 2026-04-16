@@ -12,7 +12,19 @@ merges never conflict with our work.
 | **Subject**         | The security-governance problem in OpenClaw-style agentic-AI runtimes and how DefenseClaw addresses it |
 | **Upstream**        | `https://github.com/cisco-ai-defense/defenseclaw` (remote: `upstream`) |
 | **Our fork**        | `https://github.com/memari-majid/govclaw` (remote: `origin`) |
-| **Entry points**    | [`research/README.md`](research/README.md) · [`research/paper/paper.md`](research/paper/paper.md) · [`UPSTREAM.md`](UPSTREAM.md) |
+| **Entry points**    | [`research/PLAN.md`](research/PLAN.md) · [`research/README.md`](research/README.md) · [`research/paper/paper.md`](research/paper/paper.md) · [`UPSTREAM.md`](UPSTREAM.md) |
+| **The plan**        | **[`research/PLAN.md`](research/PLAN.md)** is the *single* research plan (per the workspace rule "keep only one plan"). |
+
+## Code of Conduct and security policy
+
+All research activity in this repository — PRs, issues, discussions,
+fixtures, talks — is governed by the repository-wide
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) (Contributor Covenant v2.1).
+Report conduct concerns to `oss-conduct@cisco.com`. Security-relevant
+findings follow the disclosure process in [`SECURITY.md`](SECURITY.md);
+never open a public issue for a security-relevant finding before
+coordinated disclosure. A compliance checklist for research commits lives
+in [`research/PLAN.md`](research/PLAN.md) §9.3.
 
 ## What this repository contains
 

@@ -6,6 +6,21 @@ except the two top-level markers `RESEARCH.md` and `UPSTREAM.md`, and a short
 banner at the top of `README.md` — belongs to us, which makes upstream syncs
 trivial.
 
+> **The plan.** [`PLAN.md`](PLAN.md) is the *single* research plan for this
+> project (per the workspace rule "keep only one plan, organised and up to
+> date"). Thesis, research questions, methodology, milestones, risks, and the
+> status board all live there. Everything else in `research/` is a supporting
+> artifact referenced from it. When priorities change, edit `PLAN.md` first.
+
+> **Code of Conduct and security policy.** All research activity, fixtures,
+> notes, PRs, issues, and discussions in this directory are governed by the
+> repository-wide [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md)
+> (Contributor Covenant v2.1). Report CoC concerns to
+> `oss-conduct@cisco.com`. Security-sensitive findings — including anything
+> discovered by the experiments below — follow the disclosure process in
+> [`SECURITY.md`](../SECURITY.md); do not open a public issue for a
+> security-relevant finding before coordinated disclosure.
+
 ## Layout
 
 ```
@@ -13,7 +28,7 @@ research/
 ├── README.md                 ← you are here
 ├── Makefile                  ← build the paper, run experiments, sync upstream
 ├── paper/
-│   ├── paper.md              ← master manuscript (pandoc markdown)
+│   ├── paper.md              ← canonical manuscript (pandoc markdown)
 │   ├── abstract.md           ← standalone abstract for easy reuse
 │   ├── references.bib        ← BibTeX references
 │   ├── figures/              ← final figures embedded in the paper
@@ -64,8 +79,16 @@ research/
 
 ## Contribution pipeline
 
+All contributors — reviewers, collaborators, and one-off PR authors — agree
+to abide by the repo [Code of Conduct](../CODE_OF_CONDUCT.md) and the
+[Security Policy](../SECURITY.md) by opening a PR here. In particular,
+never include real PII, credentials, or third-party private data in a
+fixture or note; use synthetic or documented-example values only.
+
 1. Identify a new challenge → add an entry in `notes/openclaw-challenges.md`.
 2. Map DefenseClaw's response → extend `notes/defenseclaw-mechanisms.md`.
 3. Design a measurable test → add `experiments/E0N-.../run.sh` + `results.md`.
 4. Promote findings into the manuscript → edit `paper/paper.md`.
 5. Commit to a topic branch, open a PR against `main` of this fork only.
+6. PR reviews and discussions follow the CoC; report concerns to
+   `oss-conduct@cisco.com`.
